@@ -437,8 +437,8 @@ public:
     set<hobject_t, hobject_t::BitwiseComparator> temp_cleared;
 
     ECTransaction::WritePlan plan;
-    bool requires_inplace() const { return plan.inplace; }
-    bool requires_rollforward() const { return plan.rollforward; }
+    bool requires_rmw() const { return !plan.to_read.empty(); }
+    bool invalidates_cache() const { return plan.invalidates_cache; }
 
     /// In progress read state;
     hobject_t::bitwisemap<extent_set> pending_read; // subset already being read
@@ -499,30 +499,21 @@ public:
    */
   class pipeline_state_t {
     enum {
-      NONE = 0,
-      INPLACE = 1,
-      ROLLFORWARD = 2,
-      EXCL = 3
-    };
-    int pipeline_state = NONE;
+      CACHE_VALID = 0,
+      CACHE_INVALID = 1
+    } pipeline_state = CACHE_VALID;
   public:
-    bool is_inplace() const {
-      return pipeline_state & pipeline_state_t::INPLACE;
-    }
-    bool is_rollforward() const {
-      return pipeline_state & pipeline_state_t::ROLLFORWARD;
-    }
     bool caching_enabled() const {
-      return is_rollforward();
+      return pipeline_state == CACHE_VALID;
     }
-    void set_inplace() {
-      pipeline_state |= pipeline_state_t::INPLACE;
+    bool cache_invalid() const {
+      return !caching_enabled();
     }
-    void set_rollforward() {
-      pipeline_state |= pipeline_state_t::ROLLFORWARD;
+    void invalidate() {
+      pipeline_state = CACHE_INVALID;
     }
     void clear() {
-      pipeline_state = NONE;
+      pipeline_state = CACHE_VALID;
     }
     friend ostream &operator<<(ostream &lhs, const pipeline_state_t &rhs);
   } pipeline_state;
@@ -531,17 +522,12 @@ public:
   op_list waiting_state;        /// writes waiting on pipe_state
   op_list waiting_reads;        /// writes waiting on partial stripe reads
   op_list waiting_commit;       /// writes waiting on initial commit
-  op_list waiting_rollforward;  /// writes waiting on rollforward to start
-  op_list waiting_completion;   /// waiting on rollforward to complete
   eversion_t completed_to;
   eversion_t committed_to;
   void start_rmw(Op *op, PGTransactionUPtr &&t);
   bool try_state_to_reads();
   bool try_reads_to_commit();
-  bool try_commit_to_rollforward();
-  bool try_rollforward_to_completion();
   bool try_finish_rmw();
-  void finish_op(Op *op);
   void check_ops();
 
   CephContext *cct;

@@ -25,19 +25,14 @@
 namespace ECTransaction {
   struct WritePlan {
     PGTransactionUPtr t;
-    bool inplace = false; // Yes, both are possible
-    bool rollforward = false;
+    bool invalidates_cache = false; // Yes, both are possible
     hobject_t::bitwisemap<extent_set> to_read;
     hobject_t::bitwisemap<extent_set> will_write; // superset of to_read
 
     hobject_t::bitwisemap<ECUtil::HashInfoRef> hash_infos;
   };
 
-  bool requires_rollforward(
-    uint64_t prev_size,
-    const PGTransaction::ObjectOperation &op);
-
-  bool requires_inplace(
+  bool requires_overwrite(
     uint64_t prev_size,
     const PGTransaction::ObjectOperation &op);
 
@@ -56,12 +51,8 @@ namespace ECTransaction {
 	uint64_t projected_size =
 	  hinfo->get_projected_total_logical_size(sinfo);
 
-	if (requires_rollforward(projected_size, i.second)) {
-	  plan.rollforward = true;
-	}
-	if (requires_inplace(projected_size, i.second)) {
-	  assert(!requires_rollforward(projected_size, i.second));
-	  plan.inplace = true;
+	if (i.second.has_source()) {
+	  plan.invalidates_cache = true;
 	}
 
 	if (i.second.is_delete()) {
@@ -166,6 +157,7 @@ namespace ECTransaction {
 	hinfo->set_projected_total_logical_size(
 	  sinfo,
 	  projected_size);
+	assert(plan.to_read[i.first].empty() || !i.second.has_source());
       });
     plan.t = std::move(t);
     return plan;
@@ -184,40 +176,6 @@ namespace ECTransaction {
     set<hobject_t, hobject_t::BitwiseComparator> *temp_added,
     set<hobject_t, hobject_t::BitwiseComparator> *temp_removed,
     DoutPrefixProvider *dpp);
-
-
-  void generate_rollback(
-    pg_t pgid,
-    const hobject_t &oid,
-    PGTransaction::ObjectOperation &op,
-    const ECUtil::stripe_info_t &sinfo,
-    ErasureCodeInterfaceRef &ecimpl,
-    ECUtil::HashInfoRef hinfo,
-    hobject_t::bitwisemap<ECUtil::HashInfoRef> &hash_infos,
-    hobject_t::bitwisemap<ObjectContextRef> &obc_map,
-    ObjectContextRef obc,
-    bool legacy_log_entries,
-    pg_log_entry_t *log_entry, // optional
-    extent_map &written,
-    map<shard_id_t, ObjectStore::Transaction> *transactions,
-    DoutPrefixProvider *dpp);
-
-  void generate_rollforward(
-    pg_t pgid,
-    const hobject_t &oid,
-    const map<string, boost::optional<bufferlist> > &attrs,
-    const boost::optional<pair<uint64_t, uint64_t> > &truncate,
-    const extent_map &partial_extents,
-    const PGTransaction::ObjectOperation::buffer_update_type &buffer_updates,
-    const ECUtil::stripe_info_t &sinfo,
-    ErasureCodeInterfaceRef &ecimpl,
-    ECUtil::HashInfoRef hinfo,
-    ObjectContextRef obc,
-    pg_log_entry_t &log_entry,
-    extent_map &written,
-    map<shard_id_t, ObjectStore::Transaction> *transactions,
-    DoutPrefixProvider *dpp);
-
 };
 
 #endif

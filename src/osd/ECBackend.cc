@@ -40,14 +40,10 @@ struct ECRecoveryHandle : public PGBackend::RecoveryHandle {
 
 ostream &operator<<(ostream &lhs, const ECBackend::pipeline_state_t &rhs) {
   switch (rhs.pipeline_state) {
-  case ECBackend::pipeline_state_t::NONE:
-      return lhs << "NONE";
-  case ECBackend::pipeline_state_t::INPLACE:
-    return lhs << "INPLACE";
-  case ECBackend::pipeline_state_t::ROLLFORWARD:
-    return lhs << "ROLLFORWARD";
-  case ECBackend::pipeline_state_t::EXCL:
-    return lhs << "EXCL";
+  case ECBackend::pipeline_state_t::CACHE_VALID:
+    return lhs << "CACHE_VALID";
+  case ECBackend::pipeline_state_t::CACHE_INVALID:
+    return lhs << "CACH_INVALID";
   default:
     assert(0 == "invalid pipeline state");
   }
@@ -1363,8 +1359,6 @@ void ECBackend::on_change()
   waiting_reads.clear();
   waiting_state.clear();
   waiting_commit.clear();
-  waiting_rollforward.clear();
-  waiting_completion.clear();
   for (auto &&op: tid_to_op_map) {
     cache.release_write_pin(op.second.pin);
   }
@@ -1771,36 +1765,24 @@ bool ECBackend::try_state_to_reads()
     return false;
 
   Op *op = &(waiting_state.front());
-  if (op->requires_rollforward() && pipeline_state.is_inplace()) {
+  if (op->requires_rmw() && pipeline_state.cache_invalid()) {
     dout(20) << __func__ << ": blocking " << *op
-	     << " because it requires_rollforward and pipeline_state is "
-	     << pipeline_state
-	     << dendl;
-    return false;
-  } else if (op->requires_inplace() && pipeline_state.is_rollforward()) {
-    dout(20) << __func__ << ": blocking " << *op
-	     << " because it requires_inplace and pipeline_state is "
+	     << " because it requires an rmw and the cache is invalid"
 	     << pipeline_state
 	     << dendl;
     return false;
   }
+
+  if (op->invalidates_cache()) {
+    dout(20) << __func__ << ": invalidating cache after this op"
+	     << dendl;
+    pipeline_state.invalidate();
+  }
+
   waiting_state.pop_front();
   waiting_reads.push_back(*op);
 
-  if (!pipeline_state.is_rollforward() && op->requires_rollforward()) {
-    pipeline_state.set_rollforward();
-    dout(20) << __func__ << ": setting pipeline_state to rollforward "
-	     << pipeline_state
-	     << dendl;
-  }
-  if (!pipeline_state.is_inplace() && op->requires_inplace()) {
-    pipeline_state.set_inplace();
-    dout(20) << __func__ << ": setting pipeline_state to inplace "
-	     << pipeline_state
-	     << dendl;
-  }
-
-  if (pipeline_state.caching_enabled()) {
+  if (op->requires_rmw() || pipeline_state.caching_enabled()) {
     cache.open_write_pin(op->pin);
 
     extent_set empty;
@@ -1862,7 +1844,7 @@ bool ECBackend::try_reads_to_commit()
     op->hoid,
     op->delta_stats);
 
-  if (pipeline_state.caching_enabled()) {
+  if (pipeline_state.caching_enabled() || op->requires_rmw()) {
     for (auto &&hpair: op->pending_read) {
       op->remote_read_result[hpair.first].insert(
 	cache.get_remaining_extents_for_rmw(
@@ -1918,9 +1900,10 @@ bool ECBackend::try_reads_to_commit()
   for (auto &&i: written) {
     written_set[i.first] = i.second.get_interval_set();
   }
+  dout(20) << __func__ << ": written_set: " << written_set << dendl;
   assert(written_set == op->plan.will_write);
 
-  if (pipeline_state.caching_enabled()) {
+  if (pipeline_state.caching_enabled() || op->requires_rmw()) {
     for (auto &&hpair: written) {
       dout(20) << __func__ << ": " << hpair << dendl;
       cache.present_rmw_update(hpair.first, op->pin, hpair.second);
@@ -1987,7 +1970,7 @@ bool ECBackend::try_reads_to_commit()
   return true;
 }
 
-bool ECBackend::try_commit_to_rollforward()
+bool ECBackend::try_finish_rmw()
 {
   if (waiting_commit.empty())
     return false;
@@ -2004,14 +1987,7 @@ bool ECBackend::try_commit_to_rollforward()
   if (op->version > committed_to)
     committed_to = op->version;
 
-  if (!pipeline_state.is_rollforward()) {
-    assert(waiting_rollforward.empty());
-    assert(waiting_completion.empty());
-    finish_op(op);
-  } else {
-    assert(get_osdmap()->test_flag(CEPH_OSDMAP_REQUIRE_KRAKEN));
-    assert(get_parent()->get_pool().is_hacky_ecoverwrites());
-    waiting_rollforward.push_back(*op);
+  if (get_osdmap()->test_flag(CEPH_OSDMAP_REQUIRE_KRAKEN)) {
     if (op->version > get_parent()->get_log().get_can_rollback_to() &&
 	waiting_reads.empty() &&
 	waiting_commit.empty()) {
@@ -2026,64 +2002,26 @@ bool ECBackend::try_commit_to_rollforward()
       waiting_reads.push_back(*nop);
     }
   }
-  return true;
-}
 
-bool ECBackend::try_rollforward_to_completion()
-{
-  if (waiting_rollforward.empty())
-    return false;
-  Op *op = &(waiting_rollforward.front());
-
-  if (op->version > get_parent()->get_log().get_can_rollback_to()) {
-    return false;
-  }
-
-  waiting_rollforward.pop_front();
-  waiting_completion.push_back(*op);
-
-  dout(10) << __func__ << ": " << *op << dendl;
-  dout(20) << __func__ << ": " << cache << dendl;
-  return true;
-}
-
-bool ECBackend::try_finish_rmw()
-{
-  if (waiting_completion.empty())
-    return false;
-  Op *op = &(waiting_completion.front());
-  if (op->version > completed_to)
-    return false;
-  waiting_completion.pop_front();
-  finish_op(op);
-  return true;
-}
-
-void ECBackend::finish_op(Op *op) {
-  dout(10) << __func__ << ": " << *op << dendl;
-  dout(20) << __func__ << ": " << cache << dendl;
-  if (pipeline_state.caching_enabled()) {
+  if (pipeline_state.caching_enabled() || op->requires_rmw()) {
     cache.release_write_pin(op->pin);
   }
   tid_to_op_map.erase(op->tid);
 
   if (waiting_reads.empty() &&
-      waiting_commit.empty() &&
-      waiting_rollforward.empty() &&
-      waiting_completion.empty()) {
+      waiting_commit.empty()) {
     pipeline_state.clear();
     dout(20) << __func__ << ": clearing pipeline_state "
 	     << pipeline_state
 	     << dendl;
   }
+  return true;
 }
 
 void ECBackend::check_ops()
 {
   while (try_state_to_reads() ||
 	 try_reads_to_commit() ||
-	 try_commit_to_rollforward() ||
-	 try_rollforward_to_completion() ||
 	 try_finish_rmw());
 }
 
