@@ -544,31 +544,6 @@ void ECBackend::continue_recovery_op(
 	::encode(*(op.hinfo), op.xattrs[ECUtil::get_hinfo_key()]);
       }
 
-      extent_set need;
-      need.insert(from, amount);
-      extent_map result = cache.get_all_pinned_spanning_extents(op.hoid, need);
-      if (!result.empty()) {
-	auto fst = result.begin();
-	if (fst.get_off() == from) {
-	  // just write out this chunk
-	  bufferlist bl = fst.get_val();
-	  amount = fst.get_len();
-	  assert(sinfo.logical_offset_is_stripe_aligned(amount));
-	  op.extent_requested = make_pair(
-	    from,
-	    amount);
-	  int r = ECUtil::encode(
-	    sinfo, ec_impl, bl, want, &(op.returned_data));
-	  assert(r == 0);
-	  assert(op.obc);
-	  continue;
-	} else {
-	  // don't read the next bit yet, we'll get to it next
-	  amount = fst.get_off() - from;
-	  assert(sinfo.logical_offset_is_stripe_aligned(amount));
-	}
-      }
-
       set<pg_shard_t> to_read;
       int r = get_min_avail_to_read_shards(
 	op.hoid, want, true, false, &to_read);
@@ -2044,11 +2019,9 @@ void ECBackend::objects_read_async(
 {
   hobject_t::bitwisemap<std::list<boost::tuple<uint64_t, uint64_t, uint32_t> > >
     reads;
-  unique_ptr<ExtentCache::read_pin> pin(new ExtentCache::read_pin);
-  cache.open_read_pin(*pin);
 
-  extent_set es;
   uint32_t flags = 0;
+  extent_set es;
   for (list<pair<boost::tuple<uint64_t, uint64_t, uint32_t>,
 	 pair<bufferlist*, Context*> > >::const_iterator i =
 	 to_read.begin();
@@ -2064,16 +2037,10 @@ void ECBackend::objects_read_async(
     flags |= i->first.get<2>();
   }
 
-  dout(20) << __func__ << ": " << cache << dendl;
-  auto results = cache.get_or_pin_extents(
-    hoid,
-    *pin,
-    es);
-
-  if (!results.must_get.empty()) {
+  if (!es.empty()) {
     auto &offsets = reads[hoid];
-    for (auto j = results.must_get.begin();
-	 j != results.must_get.end();
+    for (auto j = es.begin();
+	 j != es.end();
 	 ++j) {
       offsets.push_back(
 	boost::make_tuple(
@@ -2083,21 +2050,11 @@ void ECBackend::objects_read_async(
     }
   }
 
-  dout(20) << __func__ << ":"
-	   << " results.got: " << results.got
-	   << " results.pending: " << results.pending
-	   << " results.must_get: " << results.must_get
-	   << dendl;
-  dout(20) << __func__ << ": " << cache << dendl;
-
   struct cb {
     ECBackend *ec;
     hobject_t hoid;
     list<pair<boost::tuple<uint64_t, uint64_t, uint32_t>,
 	      pair<bufferlist*, Context*> > > to_read;
-    unique_ptr<ExtentCache::read_pin> pin;
-    extent_set need;
-    extent_map got;
     unique_ptr<Context> on_complete;
     cb(const cb&) = delete;
     cb(cb &&) = default;
@@ -2105,15 +2062,10 @@ void ECBackend::objects_read_async(
        const hobject_t &hoid,
        const list<pair<boost::tuple<uint64_t, uint64_t, uint32_t>,
                   pair<bufferlist*, Context*> > > &to_read,
-       unique_ptr<ExtentCache::read_pin> &&pin,
-       extent_set &&need,
-       extent_map &&got,
        Context *on_complete)
-      : ec(ec), hoid(hoid),
+      : ec(ec),
+	hoid(hoid),
 	to_read(to_read),
-	pin(std::move(pin)),
-	need(std::move(need)),
-	got(std::move(got)),
 	on_complete(on_complete) {}
     void operator()(hobject_t::bitwisemap<extent_map> &&results) {
       auto dpp = ec->get_parent()->get_dpp();
@@ -2121,14 +2073,8 @@ void ECBackend::objects_read_async(
 			 << dendl;
       ldpp_dout(dpp, 20) << "objects_read_async_cb: cache: " << ec->cache
 			 << dendl;
-      auto &res = results[hoid];
-      got.insert(res);
-      got.insert(
-	ec->cache.present_get_extents_read(
-	  hoid,
-	  *pin,
-	  res,
-	  need));
+
+      auto &got = results[hoid];
 
       for (auto &&read: to_read) {
 	assert(read.second.first);
@@ -2155,9 +2101,6 @@ void ECBackend::objects_read_async(
       }
     }
     ~cb() {
-      if (pin) {
-	ec->cache.release_read_pin(*pin);
-      }
       for (auto &&i: to_read) {
 	delete i.second.second;
       }
@@ -2168,10 +2111,9 @@ void ECBackend::objects_read_async(
     reads,
     fast_read,
     make_gen_lambda_context<hobject_t::bitwisemap<extent_map> &&, cb>(
-      cb(this, hoid, to_read,
-	 std::move(pin),
-	 std::move(results.pending),
-	 std::move(results.got),
+      cb(this,
+	 hoid,
+	 to_read,
 	 on_complete)));
 }
 

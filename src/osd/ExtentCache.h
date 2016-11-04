@@ -30,15 +30,13 @@
 /**
    ExtentCache
 
-   The main purpose of this cache is to make sure that extents with
-   committed but unapplied writes can be read -- both for normal reads
-   and for rmw write cycles.
+   The main purpose of this cache is to ensure that we can pipeline
+   overlapping partial overwrites.
 
    To that end we need to ensure that an extent pinned for an operation is
    live until that operation completes.  However, a particular extent
    might be pinned by multiple operations (several pipelined writes
-   on the same object, or a read on an extent pinned by a committed, but
-   unapplied write).  We'd like a few properties:
+   on the same object).
 
    1) When we complete an operation, we only look at extents owned only
       by that operation.
@@ -60,24 +58,17 @@
       not applied).
 
    Our strategy therefore will be to have whichever in-progress op will
-   finish "last" be the owner of a particular extent.
+   finish "last" be the owner of a particular extent.  For now, we won't
+   cache reads, so 2) simply means that we can assume that reads and
+   recovery operations imply no unstable extents on the object in
+   question.
 
-   From invariant 2), an extent (which must be part of an object) can be
-   participating in one of two pipelines at any particular point:
+   Write: WaitRead -> WaitCommit -> Complete
 
-   Write: [WaitRead -> ] WaitCommit -> WaitApply -> Complete
-   Read: WaitRead -> Complete
-
-   [WaitRead -> ] for Write indicates that we may need to start by
-   reading the full extents for any partial modifications.
    Invariant 1) above actually indicates that we can't have writes
    bypassing the WaitRead state while there are writes waiting on
    Reads.  Thus, the set of operations pinning a particular extent
-   must always complete in order or arrival (What about reads
-   overlapping an extent pinned by an unapplied write?  Either could
-   complete first!  See below, the read can simply grab the buffer
-   in that case, no need pin unless the extent isn't present or is
-   pinned by reads).
+   must always complete in order or arrival.
 
    This suggests that a particular extent may be in only the following
    states:
@@ -93,60 +84,14 @@
 	reads can be in progress).
    2) Write Pinned N:
       - This extent has data corresponding to some reqid M <= N
-      - The extent must persist until Write reqid N completes
+      - The extent must persist until Write reqid N commits
       - All ops pinning this extent are writes in some Write
-        state (all are actually possible).  Reads *are* possible
-        if the extent is in this state, but if a read comes in,
-        it must be the case that all writes pinning the extent
-        are in the WaitApply state of the write pipeline.
-   3) Read Pending N:
-      - Some read with reqid <= N is currently fetching the data for
-        this extent.
-      - All ops pinning this extent are reads in the WaitRead state
-        of the Read pipeline.
-      - There can be no unapplied writes in this case.  When a read
-        arrives, any writes pinning a particular extent must be
-	committed, but not applied.  In that case, we simply take
-	the data and run, no need to pin it (more on this below).
-	The only way we transition to Pending is if the extent is
-	fully applied.  Furthermore, no writes can arrive until
-	all reads complete by Invariant 2.
-    4) Read Pinned N:
-      - Some read with reqid <= N is currently fetching data for
-        other extents, and this extent was in state Pending when
-	it started.
-      - All ops pinning this extent are reads in the WaitRead state
-        of the Read pipeline.
-      - There can be no unapplied writes in this case (as above).
-      - The extent must have transitioned here from Pending.
+        state (all are possible).  Reads are not possible
+	in this state (or the others) due to 2).
 
-
-   States 3 and 4 require a bit of explanation.  Writes and reads have
-   somewhat different requirements.  Writes actually cannot "read"
-   the extent they want to use for an rmw out of cache until they
-   enter WaitCommit, because until that point they cannot be sure
-   that there aren't other writes ahead of them in the queue which
-   will modify that extent.  Thus, writes need to "reserve" all
-   extents they will eventually need up front, but can't actually
-   read them until everything is ready to go.  Reads don't have
-   that requirement because there can be no writes in progress while
-   a read is in progress (again, except for committed, but un-applied
-   writes which are ok because transitioning from committed to
-   applied does not change the logical contents of the object).
-
-   There is one other kind of read which is important: backfill
-   recovery.  When the recovery operation is iniated, writes are
-   blocked, so we can be sure that all writes are committed.
-   Also, we don't care about ordering of backfill reads w.r.t.
-   client reads, so no need to worry about carefully setting
-   extents to the WaitRead state.  Thus, all we have to do it just
-   check the cache for pinned reads and return them without extending
-   the pin or anything.
-
-   All of the above suggests that there are 6 things users can
-   ask of the cache corresponding to the 2 read pipeline states,
-   3 write pipeline states, and backfill reads. See below for
-   the public methods and comments.
+   All of the above suggests that there are 3 things users can
+   ask of the cache corresponding to the 3 Write pipelines
+   states.
  */
 
 /// If someone wants these types, but not ExtentCache, move to another file
@@ -194,11 +139,6 @@ private:
 
     bool is_pending() const {
       return bl == boost::none;
-    }
-
-    bool pinned_by_read() const {
-      assert(parent_pin_state);
-      return parent_pin_state->is_read();
     }
 
     bool pinned_by_write() const {
@@ -411,10 +351,8 @@ private:
     enum pin_type_t {
       NONE,
       WRITE,
-      READ,
     };
     pin_type_t pin_type = NONE;
-    bool is_read() const { return pin_type == READ; }
     bool is_write() const { return pin_type == WRITE; }
 
     pin_state(const pin_state &other) = delete;
@@ -455,14 +393,6 @@ private:
   }
 
 public:
-  class read_pin : private pin_state {
-    friend class ExtentCache;
-    void open(uint64_t in_tid) {
-      _open(in_tid, pin_state::READ);
-    }
-  public:
-    read_pin() : pin_state() {}
-  };
   class write_pin : private pin_state {
     friend class ExtentCache;
   private:
@@ -477,10 +407,6 @@ public:
     pin.open(next_write_tid++);
   }
 
-  void open_read_pin(read_pin &pin) {
-    pin.open(next_read_tid++);
-  }
-
   /**
    * Reserves extents required for rmw, and learn
    * which need to be read
@@ -493,8 +419,6 @@ public:
    * - Empty -> Write Pending pin.reqid
    * - Write Pending N -> Write Pending pin.reqid
    * - Write Pinned N -> Write Pinned pin.reqid
-   * - Read Pending N -> invalid, violates Invariant 1
-   * - Read Pinned N -> invalid, violates Invariant 1
    *
    * @param oid [in] object undergoing rmw
    * @param pin [in,out] pin to use (obtained from create_write_pin)
@@ -539,8 +463,6 @@ public:
    * - Write Pending N -> Write Pinned N, update buffer
    *     (assert N >= pin.reqid)
    * - Write Pinned N -> Update buffer (assert N >= pin.reqid)
-   * - Read Pending N -> invalid, violates Invariant 1
-   * - Read Pinned N -> invalid, violates Invariant 1
    *
    * @param oid [in] object
    * @param pin [in,out] pin associated with this IO
@@ -557,88 +479,6 @@ public:
    */
   void release_write_pin(
     write_pin &pin) {
-    release_pin(pin);
-  }
-
-  /**
-   * Get read extents available, pin the rest, determine
-   * which extents this operation is responsible for
-   * fetching
-   *
-   * The set of requested extents can be partitioned into:
-   * - Extents present: just return them
-   * - Extents pending: will be present by the time all
-   *                    preceding reads are done
-   * - Extents not present: must be fetched by this IO
-   * The return value reflects this trichotomy.
-   *
-   *  Transition table:
-   *  - Empty -> Read Pending pin.reqid (goes into fetch, need)
-   *  - Write Pending N -> invalid, violates Invariant 1
-   *  - Write Pinned N -> no change, no new pin, goes into got
-   *  - Read Pending N -> Read Pending pin.reqid (goes into need)
-   *  - Read Pinned N -> no change, no new pin, goes into got  *
-   *
-   * @param oid [in] object
-   * @param pin [in,out] pin associated with this IO
-   * @param to_get [in] requested extents
-   * @return { got: extents already in cache
-   *           pending: extents with pending reads
-   *           must_get: extents which this operation must read
-   *         }
-   */
-  struct get_or_pin_results {
-    extent_map got;
-    extent_set pending;
-    extent_set must_get;
-  };
-  get_or_pin_results get_or_pin_extents(
-    const hobject_t &oid,
-    read_pin &pin,
-    const extent_set &to_get);
-
-  /**
-   * Present extents from must_get, get extents
-   * from pending.
-   *
-   * Transition table:
-   * - Empty -> invalid, must be pinned or would have been in got
-   * - Write Pending N -> invalid, violates Invariant 1
-   * - Write Pinned N -> invalid, would have been in got in 5)
-   * - Read Pending pin.reqid -> Empty it's our pin, just drop it
-   * - Read Pending N -> Read Pinned N (assert N > pin.reqid)
-   * - Read Pinned N -> invalid, only one fetcher
-   *
-   * @param oid [in] object
-   * @param pin [in,out] pin associated with this IO
-   * @param got [in] extents requested by get_or_pin_results
-   * @param need [in] exents still required
-   * @return map of extents in need
-   */
-  extent_map present_get_extents_read(
-    const hobject_t &oid,
-    read_pin &pin,
-    const extent_map &got,
-    const extent_set &need);
-
-  /**
-   * Get all extents spanning the specified extent_set -- don't pin them
-   *
-   * No transition table, doesn't pin anything
-   *
-   * @param oid [in] object
-   * @param need [in] extents to read
-   * @return map of overlapping extents
-   */
-  extent_map get_all_pinned_spanning_extents(
-    const hobject_t &oid,
-    const extent_set &need);
-
-  /**
-   * Release all buffers pinned by pin
-   */
-  void release_read_pin(
-    read_pin &pin) {
     release_pin(pin);
   }
 

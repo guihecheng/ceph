@@ -213,123 +213,6 @@ void ExtentCache::present_rmw_update(
   }
 }
 
-ExtentCache::get_or_pin_results ExtentCache::get_or_pin_extents(
-  const hobject_t &oid,
-  read_pin &pin,
-  const extent_set &to_get)
-{
-  if (to_get.empty()) {
-    return get_or_pin_results();;
-  }
-  get_or_pin_results ret;
-  auto &eset = get_or_create(oid);
-  for (auto &&res: to_get) {
-    eset.traverse_update(
-      pin,
-      res.first,
-      res.second,
-      [&](uint64_t off, uint64_t len,
-	  extent *ext, object_extent_set::update_action *action) {
-	if (!ext) {
-	  ret.must_get.insert(off, len);
-	  action->action = object_extent_set::update_action::UPDATE_PIN;
-	} else if (ext->is_pending()) {
-	  ret.pending.insert(off, len);
-	  action->action = object_extent_set::update_action::UPDATE_PIN;
-	} else {
-	  bufferlist bl;
-	  bl.substr_of(
-	    *(ext->bl),
-	    off - ext->offset,
-	    len);
-	  ret.got.insert(off, len, bl);
-	}
-      });
-  }
-  return ret;
-}
-
-
-extent_map ExtentCache::get_all_pinned_spanning_extents(
-  const hobject_t &oid,
-  const extent_set &need)
-{
-  extent_map ret;
-  auto *eset = get_if_exists(oid);
-  if (!eset)
-    return ret;
-  for (auto &&res: need) {
-    auto range = eset->get_containing_range(res.first, res.second);
-    for (auto p = range.first; p != range.second;) {
-      extent *ext = &*p;
-      ++p;
-      if (ext->bl) {
-	uint64_t offset = MAX(res.first, ext->offset);
-	uint64_t length =
-	  MIN(ext->offset + ext->length, res.first + res.second) -
-	  offset;
-	bufferlist bl;
-	bl.substr_of(
-	  *(ext->bl),
-	  ext->offset < res.first ? offset - ext->offset : 0,
-	  length);
-	ret.insert(
-	  offset,
-	  length,
-	  bl);
-      }
-    }
-  }
-  return ret;
-}
-
-extent_map ExtentCache::present_get_extents_read(
-  const hobject_t &oid,
-  read_pin &pin,
-  const extent_map &got,
-  const extent_set &need)
-{
-  if (got.empty() && need.empty()) {
-    return extent_map();
-  }
-  auto &eset = get_or_create(oid);
-  for (auto &&res: got) {
-    eset.traverse_update(
-      pin,
-      res.get_off(),
-      res.get_len(),
-      [&](uint64_t off, uint64_t len,
-	  extent *ext, object_extent_set::update_action *action) {
-	action->action = object_extent_set::update_action::NONE;
-	assert(ext && ext->pinned_by_read());
-	assert(ext->offset == off);
-	assert((ext->offset + ext->length) == (off + len));
-	action->bl = bufferlist();
-	action->bl->substr_of(
-	  res.get_val(),
-	  off - res.get_off(),
-	  len);
-      });
-  }
-  extent_map ret;
-  for (auto &&res: need) {
-    bufferlist bl;
-    eset.traverse_update(
-      pin,
-      res.first,
-      res.second,
-      [&](uint64_t off, uint64_t len,
-	  extent *ext, object_extent_set::update_action *action) {
-	action->action = object_extent_set::update_action::NONE;
-	assert(ext && ext->bl && ext->pinned_by_read());
-	bl.append(*(ext->bl));
-      });
-    assert(bl.length() == res.second);
-    ret.insert(res.first, res.second, bl);
-  }
-  return ret;
-}
-
 ostream &ExtentCache::print(ostream &out) const
 {
   out << "ExtentCache(" << std::endl;
@@ -342,7 +225,6 @@ ostream &ExtentCache::print(ostream &out) const
 	 ++exiter) {
       out << "    Extent(" << exiter->offset
 	  << "~" << exiter->get_length()
-	  << ", " << (exiter->pinned_by_read() ? "R" : "W")
 	  << ":" << exiter->pin_tid()
 	  << ")" << std::endl;
     }
