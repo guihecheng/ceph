@@ -387,7 +387,7 @@ void generate_transaction(
   assert(removed);
 
   for (auto &&le: log_entries) {
-    le.mark_unrollbackable(legacy_log_entries);
+    le.mark_unrollbackable();
     auto oiter = pgt->op_map.find(le.soid);
     if (oiter != pgt->op_map.end() && oiter->second.updated_snaps) {
       vector<snapid_t> snaps(

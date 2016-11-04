@@ -1863,8 +1863,8 @@ bool ECBackend::try_reads_to_commit()
 
   if (!get_parent()->get_pool().is_hacky_ecoverwrites()) {
     for (auto &&i: op->log_entries) {
-      if (i.is_rollforward()) {
-	derr << __func__ << ": log entry " << i << " is rollforward,"
+      if (i.requires_kraken()) {
+	derr << __func__ << ": log entry " << i << " requires kraken"
 	     << " but overwrites are not enabled!" << dendl;
 	assert(0);
       }

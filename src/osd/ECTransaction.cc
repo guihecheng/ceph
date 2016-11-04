@@ -186,9 +186,8 @@ void ECTransaction::generate_transactions(
 			   << dendl;
       }
 
-      TransactionInfo::LocalRollBack lrb;
       if (entry && op.updated_snaps) {
-	lrb.update_snaps(op.updated_snaps->first);
+	entry->mod_desc.update_snaps(op.updated_snaps->first);
       }
 
       map<string, boost::optional<bufferlist> > xattr_rollback;
@@ -244,7 +243,7 @@ void ECTransaction::generate_transactions(
 	  obc->attr_cache.clear();
 	}
 	if (entry) {
-	  lrb.rmobject(entry->version.version);
+	  entry->mod_desc.rmobject(entry->version.version);
 	  for (auto &&st: *transactions) {
 	    st.second.collection_move_rename(
 	      coll_t(spg_t(pgid, st.first)),
@@ -263,7 +262,7 @@ void ECTransaction::generate_transactions(
       }
 
       if (op.is_fresh_object() && entry) {
-	lrb.create();
+	entry->mod_desc.create();
       }
 
       match(
@@ -366,7 +365,7 @@ void ECTransaction::generate_transactions(
 	assert(!xattr_rollback.empty());
       }
       if (entry && !xattr_rollback.empty()) {
-	lrb.setattrs(xattr_rollback);
+	entry->mod_desc.setattrs(xattr_rollback);
       }
 
       if (op.alloc_hint) {
@@ -642,7 +641,6 @@ void ECTransaction::generate_transactions(
 			   << append_after
 			   << dendl;
 	entry->mod_desc.append(append_after);
-	lrb.append(append_after);
       }
 
       bufferlist hbuf;
@@ -653,11 +651,6 @@ void ECTransaction::generate_transactions(
 	  ghobject_t(oid, ghobject_t::NO_GEN, i.first),
 	  ECUtil::get_hinfo_key(),
 	  hbuf);
-      }
-      if (entry) {
-	entry->mark_local_rollback(
-	  lrb,
-	  legacy_log_entries);
       }
     });
 }

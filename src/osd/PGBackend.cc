@@ -41,7 +41,7 @@ void PGBackend::rollback(
   ObjectStore::Transaction *t)
 {
 
-  struct RollbackVisitor : public TransactionInfo::LocalRollBack::Visitor {
+  struct RollbackVisitor : public ObjectModDesc::Visitor {
     const hobject_t &hoid;
     PGBackend *pg;
     ObjectStore::Transaction t;
@@ -86,25 +86,17 @@ void PGBackend::rollback(
     }
   };
 
-  assert(entry.can_rollback());
-  entry.match_transaction_info(
-    [&](const TransactionInfo::LocalRollBack &lrb) {
-      assert(lrb.can_rollback());
-      RollbackVisitor vis(entry.soid, this);
-      lrb.visit(&vis);
-      t->append(vis.t);
-    },
-    [&](const TransactionInfo::LocalRollForward &lrf) {
-      if (!lrf.extents.empty())
-	trim_stashed_object(entry.soid, lrf.version, t);
-    });
+  assert(entry.mod_desc.can_rollback());
+  RollbackVisitor vis(entry.soid, this);
+  entry.mod_desc.visit(&vis);
+  t->append(vis.t);
 }
 
-struct LRBTrimmer : public TransactionInfo::LocalRollBack::Visitor {
+struct Trimmer : public ObjectModDesc::Visitor {
   const hobject_t &soid;
   PGBackend *pg;
   ObjectStore::Transaction *t;
-  LRBTrimmer(
+  Trimmer(
     const hobject_t &soid,
     PGBackend *pg,
     ObjectStore::Transaction *t)
@@ -123,53 +115,10 @@ void PGBackend::rollforward(
 {
   auto dpp = get_parent()->get_dpp();
   ldpp_dout(dpp, 20) << __func__ << ": entry=" << entry << dendl;
-  ldpp_dout(dpp, 20) << __func__ << ": ti=" << entry.transaction_info << dendl;
   if (!entry.can_rollback())
     return;
-  entry.match_transaction_info(
-    [&](const TransactionInfo::LocalRollBack &lrb) {
-      LRBTrimmer trimmer(entry.soid, this, t);
-      lrb.visit(&trimmer);
-    },
-    [&](const TransactionInfo::LocalRollForward &lrf) {
-      if (lrf.truncate) {
-	ldpp_dout(dpp, 20) << "  truncate: truncate=" << *(lrf.truncate) << dendl;
-	t->truncate(
-	  coll,
-	  ghobject_t(
-	    entry.soid, ghobject_t::NO_GEN, get_parent()->whoami_shard().shard),
-	  *(lrf.truncate));
-      }
-      if (!lrf.extents.empty()) {
-	ldpp_dout(dpp, 20) << "  rollforward: extents=" << lrf.extents << dendl;
-	t->move_ranges_destroy_src(
-	  coll,
-	  ghobject_t(
-	    entry.soid, lrf.version, get_parent()->whoami_shard().shard),
-	  ghobject_t(
-	    entry.soid, ghobject_t::NO_GEN, get_parent()->whoami_shard().shard),
-	  lrf.extents);
-      }
-      map<string, bufferlist> attrs;
-      for (auto &&attr: lrf.new_attrs) {
-	if (attr.second) {
-	  attrs.insert(make_pair(attr.first, *(attr.second)));
-	} else {
-	  t->rmattr(
-	    coll,
-	    ghobject_t(
-	      entry.soid, ghobject_t::NO_GEN,
-	      get_parent()->whoami_shard().shard),
-	    attr.first);
-	}
-      }
-      t->setattrs(
-	coll,
-	ghobject_t(
-	  entry.soid, ghobject_t::NO_GEN,
-	  get_parent()->whoami_shard().shard),
-	attrs);
-    });
+  Trimmer trimmer(entry.soid, this, t);
+  entry.mod_desc.visit(&trimmer);
 }
 
 void PGBackend::trim(
@@ -178,15 +127,8 @@ void PGBackend::trim(
 {
   if (!entry.can_rollback())
     return;
-  entry.match_transaction_info(
-    [&](const TransactionInfo::LocalRollBack &lrb) {
-      LRBTrimmer trimmer(entry.soid, this, t);
-      lrb.visit(&trimmer);
-    },
-    [&](const TransactionInfo::LocalRollForward &lrf) {
-      if (!lrf.extents.empty())
-	trim_stashed_object(entry.soid, lrf.version, t);
-    });
+  Trimmer trimmer(entry.soid, this, t);
+  entry.mod_desc.visit(&trimmer);
 }
 
 void PGBackend::try_stash(

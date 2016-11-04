@@ -28,7 +28,6 @@
 #include "include/rados/rados_types.hpp"
 #include "include/mempool.h"
 
-#include "common/inline_variant.h"
 #include "msg/msg_types.h"
 #include "include/types.h"
 #include "include/utime.h"
@@ -2590,206 +2589,151 @@ inline ostream& operator<<(ostream& out, const pg_query_t& q) {
 }
 
 class PGBackend;
-
-class TransactionInfo {
-  bool legacy = false;
+class ObjectModDesc {
+  bool can_local_rollback;
+  bool rollback_info_completed;
 public:
-  /**
-   * Formerly known as ObjectModDesc, encoding is identical
-   */
-  class LocalRollBack {
-    bool can_local_rollback;
-    bool rollback_info_completed;
+  class Visitor {
   public:
-    class Visitor {
-    public:
-      virtual void append(uint64_t old_offset) {}
-      virtual void setattrs(map<string, boost::optional<bufferlist> > &attrs) {}
-      virtual void rmobject(version_t old_version) {}
-      /**
-	 * Used to support the unfound_lost_delete log event: if the stashed
-	 * version exists, we unstash it, otherwise, we do nothing.  This way
-	 * each replica rolls back to whatever state it had prior to the attempt
-	 * at mark unfound lost delete
-	 */
-      virtual void try_rmobject(version_t old_version) {
-	rmobject(old_version);
-      }
-      virtual void create() {}
-      virtual void update_snaps(set<snapid_t> &old_snaps) {}
-      virtual ~Visitor() {}
-    };
-    void visit(Visitor *visitor) const;
-    mutable bufferlist bl;
-    enum ModID {
-      APPEND = 1,
-      SETATTRS = 2,
-      DELETE = 3,
-      CREATE = 4,
-      UPDATE_SNAPS = 5,
-      TRY_DELETE = 6
-    };
-    LocalRollBack() : can_local_rollback(true), rollback_info_completed(false) {}
-    void claim(LocalRollBack &other) {
-      bl.clear();
-      bl.claim(other.bl);
-      can_local_rollback = other.can_local_rollback;
-      rollback_info_completed = other.rollback_info_completed;
-    }
-    void swap(LocalRollBack &other) {
-      bl.swap(other.bl);
-
-      bool temp = other.can_local_rollback;
-      other.can_local_rollback = can_local_rollback;
-      can_local_rollback = temp;
-
-      temp = other.rollback_info_completed;
-      other.rollback_info_completed = rollback_info_completed;
-      rollback_info_completed = temp;
-    }
-    void append_id(ModID id) {
-      uint8_t _id(id);
-      ::encode(_id, bl);
-    }
-    void append(uint64_t old_size) {
-      if (!can_local_rollback || rollback_info_completed)
-	return;
-      ENCODE_START(1, 1, bl);
-      append_id(APPEND);
-      ::encode(old_size, bl);
-      ENCODE_FINISH(bl);
-    }
-    void setattrs(const map<string, boost::optional<bufferlist> > &old_attrs) {
-      if (!can_local_rollback || rollback_info_completed)
-	return;
-      ENCODE_START(1, 1, bl);
-      append_id(SETATTRS);
-      ::encode(old_attrs, bl);
-      ENCODE_FINISH(bl);
-    }
-    bool rmobject(version_t deletion_version) {
-      if (!can_local_rollback || rollback_info_completed)
-	return false;
-      ENCODE_START(1, 1, bl);
-      append_id(DELETE);
-      ::encode(deletion_version, bl);
-      ENCODE_FINISH(bl);
-      rollback_info_completed = true;
-      return true;
-    }
-    bool try_rmobject(version_t deletion_version) {
-      if (!can_local_rollback || rollback_info_completed)
-	return false;
-      ENCODE_START(1, 1, bl);
-      append_id(TRY_DELETE);
-      ::encode(deletion_version, bl);
-      ENCODE_FINISH(bl);
-      rollback_info_completed = true;
-      return true;
-    }
-    void create() {
-      if (!can_local_rollback || rollback_info_completed)
-	return;
-      rollback_info_completed = true;
-      ENCODE_START(1, 1, bl);
-      append_id(CREATE);
-      ENCODE_FINISH(bl);
-    }
-    void update_snaps(const set<snapid_t> &old_snaps) {
-      if (!can_local_rollback || rollback_info_completed)
-	return;
-      ENCODE_START(1, 1, bl);
-      append_id(UPDATE_SNAPS);
-      ::encode(old_snaps, bl);
-      ENCODE_FINISH(bl);
-    }
-
-    // cannot be rolled back
-    void mark_unrollbackable() {
-      can_local_rollback = false;
-      bl.clear();
-    }
-    bool can_rollback() const {
-      return can_local_rollback;
-    }
-    bool empty() const {
-      return can_local_rollback && (bl.length() == 0);
-    }
-
+    virtual void append(uint64_t old_offset) {}
+    virtual void setattrs(map<string, boost::optional<bufferlist> > &attrs) {}
+    virtual void rmobject(version_t old_version) {}
     /**
-     * Create fresh copy of bl bytes to avoid keeping large buffers around
-     * in the case that bl contains ptrs which point into a much larger
-     * message buffer
+     * Used to support the unfound_lost_delete log event: if the stashed
+     * version exists, we unstash it, otherwise, we do nothing.  This way
+     * each replica rolls back to whatever state it had prior to the attempt
+     * at mark unfound lost delete
      */
-    void trim_bl() {
-      if (bl.length() > 0)
-	bl.rebuild();
+    virtual void try_rmobject(version_t old_version) {
+      rmobject(old_version);
     }
-
-    friend class TransactionInfo;
+    virtual void create() {}
+    virtual void update_snaps(set<snapid_t> &old_snaps) {}
+    virtual ~Visitor() {}
   };
-
-  struct LocalRollForward {
-    map<string, boost::optional<bufferlist> > new_attrs;
-    boost::optional<uint64_t> truncate;
-
-    vector<std::pair<uint64_t, uint64_t> > extents;
-    version_t version; // generation of source object
-    LocalRollForward() : version(0) {}
+  void visit(Visitor *visitor) const;
+  mutable bufferlist bl;
+  enum ModID {
+    APPEND = 1,
+    SETATTRS = 2,
+    DELETE = 3,
+    CREATE = 4,
+    UPDATE_SNAPS = 5,
+    TRY_DELETE = 6
   };
+  ObjectModDesc() : can_local_rollback(true), rollback_info_completed(false) {}
+  void claim(ObjectModDesc &other) {
+    bl.clear();
+    bl.claim(other.bl);
+    can_local_rollback = other.can_local_rollback;
+    rollback_info_completed = other.rollback_info_completed;
+  }
+  void claim_append(ObjectModDesc &other) {
+    if (!can_local_rollback || rollback_info_completed)
+      return;
+    if (!other.can_local_rollback) {
+      mark_unrollbackable();
+      return;
+    }
+    bl.claim_append(other.bl);
+    rollback_info_completed = other.rollback_info_completed;
+  }
+  void swap(ObjectModDesc &other) {
+    bl.swap(other.bl);
 
-private:
-  using TIType = boost::variant<
-    LocalRollBack,
-    LocalRollForward>;
-  TIType ti_type = LocalRollBack();
-public:
+    bool temp = other.can_local_rollback;
+    other.can_local_rollback = can_local_rollback;
+    can_local_rollback = temp;
 
-  bool can_rollback() const {
-    auto legacy = boost::get<LocalRollBack>(&ti_type);
-    if (legacy)
-      return legacy->can_rollback();
+    temp = other.rollback_info_completed;
+    other.rollback_info_completed = rollback_info_completed;
+    rollback_info_completed = temp;
+  }
+  void append_id(ModID id) {
+    uint8_t _id(id);
+    ::encode(_id, bl);
+  }
+  void append(uint64_t old_size) {
+    if (!can_local_rollback || rollback_info_completed)
+      return;
+    ENCODE_START(1, 1, bl);
+    append_id(APPEND);
+    ::encode(old_size, bl);
+    ENCODE_FINISH(bl);
+  }
+  void setattrs(map<string, boost::optional<bufferlist> > &old_attrs) {
+    if (!can_local_rollback || rollback_info_completed)
+      return;
+    ENCODE_START(1, 1, bl);
+    append_id(SETATTRS);
+    ::encode(old_attrs, bl);
+    ENCODE_FINISH(bl);
+  }
+  bool rmobject(version_t deletion_version) {
+    if (!can_local_rollback || rollback_info_completed)
+      return false;
+    ENCODE_START(1, 1, bl);
+    append_id(DELETE);
+    ::encode(deletion_version, bl);
+    ENCODE_FINISH(bl);
+    rollback_info_completed = true;
     return true;
   }
-
-  bool is_rollforward()  const {
-    return boost::get<LocalRollForward>(&ti_type) != nullptr;
+  bool try_rmobject(version_t deletion_version) {
+    if (!can_local_rollback || rollback_info_completed)
+      return false;
+    ENCODE_START(1, 1, bl);
+    append_id(TRY_DELETE);
+    ::encode(deletion_version, bl);
+    ENCODE_FINISH(bl);
+    rollback_info_completed = true;
+    return true;
+  }
+  void create() {
+    if (!can_local_rollback || rollback_info_completed)
+      return;
+    rollback_info_completed = true;
+    ENCODE_START(1, 1, bl);
+    append_id(CREATE);
+    ENCODE_FINISH(bl);
+  }
+  void update_snaps(set<snapid_t> &old_snaps) {
+    if (!can_local_rollback || rollback_info_completed)
+      return;
+    ENCODE_START(1, 1, bl);
+    append_id(UPDATE_SNAPS);
+    ::encode(old_snaps, bl);
+    ENCODE_FINISH(bl);
   }
 
+  // cannot be rolled back
   void mark_unrollbackable() {
-    LocalRollBack md;
-    md.mark_unrollbackable();
-    ti_type = md;
+    can_local_rollback = false;
+    bl.clear();
+  }
+  bool can_rollback() const {
+    return can_local_rollback;
+  }
+  bool empty() const {
+    return can_local_rollback && (bl.length() == 0);
   }
 
-  void mark_local_rollback(LocalRollBack desc) {
-    desc.trim_bl();
-    ti_type = desc;
+  /**
+   * Create fresh copy of bl bytes to avoid keeping large buffers around
+   * in the case that bl contains ptrs which point into a much larger
+   * message buffer
+   */
+  void trim_bl() {
+    if (bl.length() > 0)
+      bl.rebuild();
   }
-
-  void mark_local_rollforward(LocalRollForward rf) {
-    ti_type = rf;
-  }
-
-  void set_legacy(bool _legacy) {
-    legacy = _legacy;
-  }
-
-  template <typename... F>
-  void ti_type_match(F&&... f) const {
-    match(
-      ti_type,
-      std::forward<F>(f)...);
-  }
-
   void encode(bufferlist &bl) const;
   void decode(bufferlist::iterator &bl);
-  void dump(Formatter *f, bool dump_attr_values=true) const;
-  static void generate_test_instances(list<TransactionInfo*>& o);
-  friend std::ostream &operator<<(std::ostream &lhs, const TransactionInfo &rhs);
+  void dump(Formatter *f) const;
+  static void generate_test_instances(list<ObjectModDesc*>& o);
 };
-std::ostream &operator<<(std::ostream &lhs, const TransactionInfo &rhs);
-WRITE_CLASS_ENCODER(TransactionInfo)
+WRITE_CLASS_ENCODER(ObjectModDesc)
+
 
 /**
  * pg_log_entry_t - single entry/event in pg log
@@ -2838,9 +2782,8 @@ struct pg_log_entry_t {
     return get_op_name(op);
   }
 
-  // describes transaction for rollback/rollforward
-  TransactionInfo transaction_info;
-
+  // describes state for a locally-rollbackable entry
+  ObjectModDesc mod_desc;
   bufferlist snaps;   // only for clone entries
   hobject_t  soid;
   osd_reqid_t reqid;  // caller+tid to uniquely identify request
@@ -2886,6 +2829,18 @@ struct pg_log_entry_t {
     return op == DELETE || op == LOST_DELETE;
   }
 
+  bool can_rollback() const {
+    return mod_desc.can_rollback();
+  }
+
+  void mark_unrollbackable() {
+    mod_desc.mark_unrollbackable();
+  }
+
+  bool requires_kraken() const {
+    return false;
+  }
+
   // Errors are only used for dup detection, whereas
   // the index by objects is used by recovery, copy_get,
   // and other facilities that don't expect or need to
@@ -2897,31 +2852,6 @@ struct pg_log_entry_t {
   bool reqid_is_indexed() const {
     return reqid != osd_reqid_t() &&
       (op == MODIFY || op == DELETE || op == ERROR);
-  }
-
-  bool is_rollforward() const { return transaction_info.is_rollforward(); }
-  bool can_rollback() const { return transaction_info.can_rollback(); }
-
-  void mark_unrollbackable(bool legacy) {
-    transaction_info.mark_unrollbackable();
-    transaction_info.set_legacy(legacy);
-  }
-  void mark_local_rollback(
-    const TransactionInfo::LocalRollBack &lrb,
-    bool legacy) {
-    transaction_info.mark_local_rollback(lrb);
-    transaction_info.set_legacy(legacy);
-  }
-  void mark_local_rollforward(
-    const TransactionInfo::LocalRollForward &lrf) {
-    transaction_info.mark_local_rollforward(lrf);
-    transaction_info.set_legacy(false);
-  }
-
-  template <typename... F>
-  void match_transaction_info(F&&... f) const {
-    transaction_info.ti_type_match(
-      std::forward<F>(f)...);
   }
 
   string get_key_name() const;
