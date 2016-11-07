@@ -106,6 +106,28 @@ class interval_map {
     }
   }
 public:
+  interval_map intersect(K off, K len) const {
+    interval_map ret;
+    auto limits = get_range(off, len);
+    for (auto i = limits.first; i != limits.second; ++i) {
+      K o = i->first;
+      K l = i->second.first;
+      V v = i->second.second;
+      if (o < off) {
+	V p = v;
+	l -= (off - o);
+	v = s.split(off - o, l, p);
+	o = off;
+      }
+      if ((o + l) > (off + len)) {
+	V p = v;
+	l -= (o + l) - (off + len);
+	v = s.split(0, l, p);
+      }
+      ret.insert(o, l, v);
+    }
+    return ret;
+  }
   void clear() {
     m.clear();
   }
