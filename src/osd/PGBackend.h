@@ -456,12 +456,19 @@ typedef ceph::shared_ptr<const OSDMap> OSDMapRef;
      ObjectStore::Transaction *t) {
      remove(hoid, t);
    }
+
+   /// Clone the extents back into place
+   void rollback_extents(
+     version_t gen,
+     const vector<pair<uint64_t, uint64_t> > &extents,
+     const hobject_t &hoid,
+     ObjectStore::Transaction *t);
  public:
 
-   /// Trim object stashed at stashed_version
-   void trim_stashed_object(
+   /// Trim object stashed at version
+   void trim_rollback_object(
      const hobject_t &hoid,
-     version_t stashed_version,
+     version_t gen,
      ObjectStore::Transaction *t);
 
    /// List objects in collection
