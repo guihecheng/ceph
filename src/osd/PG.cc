@@ -1846,22 +1846,7 @@ void PG::activate(ObjectStore::Transaction& t,
   if (is_primary()) {
     projected_last_update = info.last_update;
   }
-  if (acting.size() >= pool.info.min_size ||
-      pool.info.is_hacky_ecoverwrites()) {
-    /* The reason this is guarded with the above check is that it's not strictly
-     * safe if acting.size < min_size since we aren't actually activating.  In
-     * that case, we might still need to rollback the entries at the head of the
-     * log if an osd comes up with an older log.  If the pool only allows inplace
-     * updates, this is no problem (i.e., no hacky ecoverwrites are enabled).
-     * However, with the rollforward entries implied by ecoverwrites
-     * implementation, not doing the rollforward would leave the on-disk state
-     * out of sync with the log in case of recovery.  For now, we'll just
-     * do the rollforward on an overwrites pool, but before this is used in real
-     * life, recovery reads need to be able to overlay unapplied rollforward
-     * updates.
-     *
-     * See http://tracker.ceph.com/issues/17158 for the considerations here
-     */
+  if (acting.size() >= pool.info.min_size) {
     PGLogEntryHandler handler{this, &t};
     pg_log.roll_forward(&handler);
   }
@@ -4143,14 +4128,6 @@ void PG::chunky_scrub(ThreadPool::TPHandle &handle)
 
         // Don't include temporary objects when scrubbing
         scrubber.start = info.pgid.pgid.get_hobj_start();
-	if (pool.info.is_hacky_ecoverwrites()) {
-	  osd->clog->info() << info.pgid << ": skipping scrub since it's"
-			    << " not supported with overwrites yet.";
-	  scrubber.start = hobject_t::get_max();
-	  scrubber.end = hobject_t::get_max();
-	}
-
-
         scrubber.state = PG::Scrubber::NEW_CHUNK;
 
 	{
@@ -4232,16 +4209,28 @@ void PG::chunky_scrub(ThreadPool::TPHandle &handle)
         }
 
         // walk the log to find the latest update that affects our chunk
-        scrubber.subset_last_update = pg_log.get_tail();
-        for (list<pg_log_entry_t>::const_reverse_iterator p = pg_log.get_log().log.rbegin();
-             p != pg_log.get_log().log.rend();
-             ++p) {
+        scrubber.subset_last_update = eversion_t();
+	for (auto p = projected_log.log.rbegin();
+	     p != projected_log.log.rend();
+	     ++p) {
           if (cmp(p->soid, scrubber.start, get_sort_bitwise()) >= 0 &&
 	      cmp(p->soid, scrubber.end, get_sort_bitwise()) < 0) {
             scrubber.subset_last_update = p->version;
             break;
-          }
-        }
+	  }
+	}
+	if (scrubber.subset_last_update == eversion_t()) {
+	  for (list<pg_log_entry_t>::const_reverse_iterator p =
+		 pg_log.get_log().log.rbegin();
+	       p != pg_log.get_log().log.rend();
+	       ++p) {
+	    if (cmp(p->soid, scrubber.start, get_sort_bitwise()) >= 0 &&
+		cmp(p->soid, scrubber.end, get_sort_bitwise()) < 0) {
+	      scrubber.subset_last_update = p->version;
+	      break;
+	    }
+	  }
+	}
 
         // ask replicas to wait until
         // last_update_applied >= scrubber.subset_last_update and then scan
