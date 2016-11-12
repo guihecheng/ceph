@@ -5043,6 +5043,11 @@ void colsplittest(
 		       52, ""));
 	t.clone(cid, a, b);
       }
+      if (i % 100) {
+	r = apply_transaction(store, &osr, std::move(t));
+	ASSERT_EQ(r, 0);
+	t = ObjectStore::Transaction();
+      }
     }
     r = apply_transaction(store, &osr, std::move(t));
     ASSERT_EQ(r, 0);
@@ -5061,11 +5066,18 @@ void colsplittest(
 			     INT_MAX, &objects, 0);
   ASSERT_EQ(r, 0);
   ASSERT_EQ(objects.size(), num_objects);
+  unsigned size = 0;
   for (vector<ghobject_t>::iterator i = objects.begin();
        i != objects.end();
        ++i) {
     ASSERT_EQ(!!(i->hobj.get_hash() & (1<<common_suffix_size)), 0u);
     t.remove(cid, *i);
+    if (++size > 100) {
+      size = 0;
+      r = apply_transaction(store, &osr, std::move(t));
+      ASSERT_EQ(r, 0);
+      t = ObjectStore::Transaction();
+    }
   }
 
   objects.clear();
@@ -5078,6 +5090,12 @@ void colsplittest(
        ++i) {
     ASSERT_EQ(!(i->hobj.get_hash() & (1<<common_suffix_size)), 0u);
     t.remove(tid, *i);
+    if (++size > 100) {
+      size = 0;
+      r = apply_transaction(store, &osr, std::move(t));
+      ASSERT_EQ(r, 0);
+      t = ObjectStore::Transaction();
+    }
   }
 
   t.remove_collection(cid);
