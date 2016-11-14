@@ -146,16 +146,6 @@ combined with the received new data and new parity blocks are
 computed. The modified blocks are sent to their respective shards and
 written. The RADOS operation is acknowledged.
 
-InPlace vs RollForward
-----------------------
-
-An update to a particular object as represented by PGTransaction may
-inplace if possible (aligned append, delete, create, etc,
-see ECTransaction::requires_inplace), or it may require that it be
-executed as a tpc rollforward operation.  Really, both are tpc, but
-in the former case, the "rollfoward" phase is really just removing
-any rollback objects.
-
 OSD Object Write and Consistency
 --------------------------------
 
@@ -163,37 +153,35 @@ Regardless of the algorithm chosen above, writing of the data is a two
 phase process: commit and rollforward. The primary sends the log
 entries with the operation described (see
 osd_types.h:TransactionInfo::(LocalRollForward|LocalRollBack).  
-In the RollBack case, the "commit" includes executing the transaction
-in place and the "rollfoward" phase simply involves removing any
-rollback objects we may have created as part of a delete.  In the
-RollForward case, we commit the log entry with the LocalRollForward
-data along with the data of the stripes to be updated in a write-aside
-object, and the "rollforward" operation takes care of moving the
-ranges into place and performing any truncates and xattr updates.
+In all cases, the "commit" is performed in place, possibly leaving some
+information required for a rollback in a write-aside object.  The
+rollforward phase occurs once all acting set replicas have committed
+the commit (sorry, overloaded term) and removes the rollback information.
 
-In both cases, once all acting/backfill shards have committed the
-initial commit, the write is considered complete (we won't roll
-it back since we'll never get a log from this interval which
-doesn't contain it).
+In the case of overwrites of exsting stripes, the rollback information
+has the form of a sparse object containing the old values of the
+overwritten extents populated using clone_range.  This is essentially
+a place-holder implementation, in real life, bluestore will have an
+efficient primitive for this.
 
-The rollforward part can be delayed as long as we are able to serve
-any reads on the relevant extents without performing an actual read.
-(see the next section).  Currently, whenever we send a write, we also
-indicate that all previously committed operations should be rolled
-forward (see ECBackend::try_reads_to_commit).  If there aren't any
-in the pipeline when we arrive at the waiting_rollforward queue,
-we start a dummy write to move things along (see the Pipeline section
-later on and ECBackend::try_commit_to_rollforwrad).
+The rollforward part can be delayed since we report the operation as
+committed once all replicas have committed.  Currently, whenever we
+send a write, we also indicate that all previously committed
+operations should be rolled forward (see
+ECBackend::try_reads_to_commit).  If there aren't any in the pipeline
+when we arrive at the waiting_rollforward queue, we start a dummy
+write to move things along (see the Pipeline section later on and
+ECBackend::try_finish_rmw).
 
 ExtentCache
 -----------
 
 It's pretty important to be able to pipeline writes on the same
-object, and we'd like to be able serve reads on a recently
-written extent without waiting for the write to rollforward.
-For these reasons, there is a cache of extents written by
-rollforward operations.  Each extent remains pinned until the
-operations referring to it are fully rolled forward.
+object.  For this reason, there is a cache of extents written by
+cacheable operations.  Each extent remains pinned until the operations
+referring to it are committed.  The pipeline prevents rmw operations
+from running until uncacheable transactions (clones, etc) are flushed
+from the pipeline.
 
 See ExtentCache.h for a detailed explanation of how the cache
 states correspond to the higher level invariants about the conditions
@@ -207,18 +195,10 @@ operations might overlap.  There are several states involved in
 processing a write operation and an important invariant which
 isn't enforced by ReplicatedPG at a higher level which need to be
 managed by ECBackend.  The important invariant is that we can't
-have inplace and rollforward operations running at the same time
+have uncacheable and rmw operations running at the same time
 on the same object.  For simplicity, we simply enforce that any
-operation which contains an inplace operation must wait until
-all in-progress rollforward operations complete and visa versa.
-There are a few reasons:
-
-  1. In place operations won't in general commute with rolling
-     forward a rollforward operation.
-  2. Pipelining a rollforward operation after an inplace operation
-     would require that the inplace operation be represented in the
-     cache which is really annoying for some operations (clone,
-     rename) and inefficient.
+operation which contains an rmw operation must wait until
+all in-progress uncacheable operations complete.
 
 There are improvements to be made here in the future.
 
