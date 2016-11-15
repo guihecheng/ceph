@@ -899,7 +899,7 @@ public:
 	  PGSnapTrim(pg->get_osdmap()->get_epoch()),
 	  cct->_conf->osd_snap_trim_cost,
 	  cct->_conf->osd_snap_trim_priority,
-	  ceph_clock_now(cct),
+	  ceph_clock_now(),
 	  entity_inst_t())));
   }
   void queue_for_scrub(PG *pg) {
@@ -910,7 +910,7 @@ public:
 	  PGScrub(pg->get_osdmap()->get_epoch()),
 	  cct->_conf->osd_scrub_cost,
 	  pg->get_scrub_priority(),
-	  ceph_clock_now(cct),
+	  ceph_clock_now(),
 	  entity_inst_t())));
   }
 
@@ -937,7 +937,7 @@ private:
 	PGRecovery(p.first, reserved_pushes),
 	cct->_conf->osd_recovery_cost,
 	cct->_conf->osd_recovery_priority,
-	ceph_clock_now(cct),
+	ceph_clock_now(),
 	entity_inst_t()));
     op_wq.queue(to_queue);
   }
@@ -952,7 +952,7 @@ public:
     _maybe_queue_recovery();
   }
   void defer_recovery(float defer_for) {
-    defer_recovery_until = ceph_clock_now(cct);
+    defer_recovery_until = ceph_clock_now();
     defer_recovery_until += defer_for;
   }
   void pause_recovery() {

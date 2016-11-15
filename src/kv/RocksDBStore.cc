@@ -365,7 +365,7 @@ void RocksDBStore::close()
 
 int RocksDBStore::submit_transaction(KeyValueDB::Transaction t)
 {
-  utime_t start = ceph_clock_now(g_ceph_context);
+  utime_t start = ceph_clock_now();
   // enable rocksdb breakdown
   // considering performance overhead, default is disabled
   if (g_conf->rocksdb_perf) {
@@ -389,7 +389,7 @@ int RocksDBStore::submit_transaction(KeyValueDB::Transaction t)
     derr << __func__ << " error: " << s.ToString() << " code = " << s.code()
          << " Rocksdb transaction: " << rocks_txc.seen << dendl;
   }
-  utime_t lat = ceph_clock_now(g_ceph_context) - start;
+  utime_t lat = ceph_clock_now() - start;
   utime_t write_memtable_time;
   utime_t write_delay_time;
   utime_t write_wal_time;
@@ -415,7 +415,7 @@ int RocksDBStore::submit_transaction(KeyValueDB::Transaction t)
 
 int RocksDBStore::submit_transaction_sync(KeyValueDB::Transaction t)
 {
-  utime_t start = ceph_clock_now(g_ceph_context);
+  utime_t start = ceph_clock_now();
   // enable rocksdb breakdown
   // considering performance overhead, default is disabled
   if (g_conf->rocksdb_perf) {
@@ -440,7 +440,7 @@ int RocksDBStore::submit_transaction_sync(KeyValueDB::Transaction t)
     derr << __func__ << " error: " << s.ToString() << " code = " << s.code()
          << " Rocksdb transaction: " << rocks_txc.seen << dendl;
   }
-  utime_t lat = ceph_clock_now(g_ceph_context) - start;
+  utime_t lat = ceph_clock_now() - start;
   utime_t write_memtable_time;
   utime_t write_delay_time;
   utime_t write_wal_time;
@@ -553,7 +553,7 @@ int RocksDBStore::get(
     const std::set<string> &keys,
     std::map<string, bufferlist> *out)
 {
-  utime_t start = ceph_clock_now(g_ceph_context);
+  utime_t start = ceph_clock_now();
   for (std::set<string>::const_iterator i = keys.begin();
        i != keys.end(); ++i) {
     std::string value;
@@ -562,7 +562,7 @@ int RocksDBStore::get(
     if (status.ok())
       (*out)[*i].append(value);
   }
-  utime_t lat = ceph_clock_now(g_ceph_context) - start;
+  utime_t lat = ceph_clock_now() - start;
   logger->inc(l_rocksdb_gets);
   logger->tinc(l_rocksdb_get_latency, lat);
   return 0;
@@ -574,7 +574,7 @@ int RocksDBStore::get(
     bufferlist *out)
 {
   assert(out && (out->length() == 0));
-  utime_t start = ceph_clock_now(g_ceph_context);
+  utime_t start = ceph_clock_now();
   int r = 0;
   string value, k;
   rocksdb::Status s;
@@ -585,7 +585,7 @@ int RocksDBStore::get(
   } else {
     r = -ENOENT;
   }
-  utime_t lat = ceph_clock_now(g_ceph_context) - start;
+  utime_t lat = ceph_clock_now() - start;
   logger->inc(l_rocksdb_gets);
   logger->tinc(l_rocksdb_get_latency, lat);
   return r;
