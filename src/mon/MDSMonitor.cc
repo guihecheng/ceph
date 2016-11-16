@@ -96,8 +96,8 @@ void MDSMonitor::create_new_fs(FSMap &fsm, const std::string &name,
   fs->mds_map.cas_pool = -1;
   fs->mds_map.max_file_size = g_conf->mds_max_file_size;
   fs->mds_map.compat = fsm.compat;
-  fs->mds_map.created = ceph_clock_now();
-  fs->mds_map.modified = ceph_clock_now();
+  fs->mds_map.created = ceph_clock_now(g_ceph_context);
+  fs->mds_map.modified = ceph_clock_now(g_ceph_context);
   fs->mds_map.session_timeout = g_conf->mds_session_timeout;
   fs->mds_map.session_autoclose = g_conf->mds_session_autoclose;
   fs->mds_map.enabled = true;
@@ -189,7 +189,7 @@ void MDSMonitor::encode_pending(MonitorDBStore::TransactionRef t)
   // Set 'modified' on maps modified this epoch
   for (auto &i : fsmap.filesystems) {
     if (i.second->mds_map.epoch == fsmap.epoch) {
-      i.second->mds_map.modified = ceph_clock_now();
+      i.second->mds_map.modified = ceph_clock_now(g_ceph_context);
     }
   }
 
@@ -285,7 +285,7 @@ void MDSMonitor::_note_beacon(MMDSBeacon *m)
   version_t seq = m->get_seq();
 
   dout(15) << "_note_beacon " << *m << " noting time" << dendl;
-  last_beacon[gid].stamp = ceph_clock_now();  
+  last_beacon[gid].stamp = ceph_clock_now(g_ceph_context);  
   last_beacon[gid].seq = seq;
 }
 
@@ -569,7 +569,7 @@ bool MDSMonitor::prepare_beacon(MonOpRequestRef op)
     }
 
     // initialize the beacon timer
-    last_beacon[gid].stamp = ceph_clock_now();
+    last_beacon[gid].stamp = ceph_clock_now(g_ceph_context);
     last_beacon[gid].seq = seq;
 
     // new incompat?
@@ -641,7 +641,7 @@ bool MDSMonitor::prepare_beacon(MonOpRequestRef op)
       dout(4) << __func__ << ": marking rank "
               << info.rank << " damaged" << dendl;
 
-      utime_t until = ceph_clock_now();
+      utime_t until = ceph_clock_now(g_ceph_context);
       until += g_conf->mds_blacklist_interval;
       const auto blacklist_epoch = mon->osdmon()->blacklist(info.addr, until);
       request_proposal(mon->osdmon());
@@ -1274,7 +1274,7 @@ bool MDSMonitor::fail_mds_gid(mds_gid_t gid)
 
   epoch_t blacklist_epoch = 0;
   if (info.rank >= 0 && info.state != MDSMap::STATE_STANDBY_REPLAY) {
-    utime_t until = ceph_clock_now();
+    utime_t until = ceph_clock_now(g_ceph_context);
     until += g_conf->mds_blacklist_interval;
     blacklist_epoch = mon->osdmon()->blacklist(info.addr, until);
   }
@@ -1761,8 +1761,8 @@ int MDSMonitor::management_command(
     new_fs->mds_map.fs_name = fs->mds_map.fs_name;
     new_fs->mds_map.max_file_size = g_conf->mds_max_file_size;
     new_fs->mds_map.compat = fsmap.compat;
-    new_fs->mds_map.created = ceph_clock_now();
-    new_fs->mds_map.modified = ceph_clock_now();
+    new_fs->mds_map.created = ceph_clock_now(g_ceph_context);
+    new_fs->mds_map.modified = ceph_clock_now(g_ceph_context);
     new_fs->mds_map.session_timeout = g_conf->mds_session_timeout;
     new_fs->mds_map.session_autoclose = g_conf->mds_session_autoclose;
     new_fs->mds_map.enabled = true;
@@ -2855,7 +2855,7 @@ void MDSMonitor::maybe_replace_gid(mds_gid_t gid,
         << " " << ceph_mds_state_name(info.state)
         << " laggy" << dendl;
       pending_fsmap.modify_daemon(info.global_id, [](MDSMap::mds_info_t *info) {
-          info->laggy_since = ceph_clock_now();
+          info->laggy_since = ceph_clock_now(g_ceph_context);
       });
       *mds_propose = true;
   }
@@ -2978,7 +2978,7 @@ void MDSMonitor::tick()
   }
 
   // check beacon timestamps
-  utime_t now = ceph_clock_now();
+  utime_t now = ceph_clock_now(g_ceph_context);
   utime_t cutoff = now;
   cutoff -= g_conf->mds_beacon_grace;
 
@@ -2986,7 +2986,7 @@ void MDSMonitor::tick()
   for (const auto &p : pending_fsmap.mds_roles) {
     auto &gid = p.first;
     if (last_beacon.count(gid) == 0) {
-      last_beacon[gid].stamp = ceph_clock_now();
+      last_beacon[gid].stamp = ceph_clock_now(g_ceph_context);
       last_beacon[gid].seq = 0;
     }
   }

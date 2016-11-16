@@ -125,12 +125,12 @@ class C_poll : public EventCallback {
     woken = true;
   }
   bool poll(int milliseconds) {
-    auto start = ceph::coarse_real_clock::now();
+    auto start = ceph::coarse_real_clock::now(g_ceph_context);
     while (!woken) {
       center->process_events(sleepus);
       usleep(sleepus);
       auto r = std::chrono::duration_cast<std::chrono::milliseconds>(
-              ceph::coarse_real_clock::now() - start);
+              ceph::coarse_real_clock::now(g_ceph_context) - start);
       if (r >= std::chrono::milliseconds(milliseconds))
         break;
     }

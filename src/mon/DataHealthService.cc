@@ -139,7 +139,7 @@ int DataHealthService::update_store_stats(DataStats &ours)
   ours.store_stats.bytes_sst = extra["sst"];
   ours.store_stats.bytes_log = extra["log"];
   ours.store_stats.bytes_misc = extra["misc"];
-  ours.last_update = ceph_clock_now();
+  ours.last_update = ceph_clock_now(g_ceph_context);
 
   return 0;
 }
@@ -159,7 +159,7 @@ int DataHealthService::update_stats()
           << " total " << prettybyte_t(ours.fs_stats.byte_total)
           << ", used " << prettybyte_t(ours.fs_stats.byte_used)
           << ", avail " << prettybyte_t(ours.fs_stats.byte_avail) << dendl;
-  ours.last_update = ceph_clock_now();
+  ours.last_update = ceph_clock_now(g_ceph_context);
 
   return update_store_stats(ours);
 }

@@ -118,7 +118,7 @@ void RGWLoadGenProcess::handle_request(RGWRequest* r)
 
   RGWLoadGenRequestEnv env;
 
-  utime_t tm = ceph_clock_now();
+  utime_t tm = ceph_clock_now(NULL);
 
   env.port = 80;
   env.content_length = req->content_length;

@@ -40,7 +40,7 @@ class DamageEntry
   DamageEntry()
   {
     id = get_random(0, 0xffffffff);
-    reported_at = ceph_clock_now();
+    reported_at = ceph_clock_now(g_ceph_context);
   }
 
   virtual damage_entry_type_t get_type() const = 0;

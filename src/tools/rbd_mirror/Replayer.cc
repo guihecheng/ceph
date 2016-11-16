@@ -457,9 +457,8 @@ void Replayer::run()
     if (m_blacklisted) {
       break;
     }
-    m_cond.WaitInterval(m_lock,
-			utime_t(g_ceph_context->_conf
-				->rbd_mirror_image_state_check_interval, 0));
+    m_cond.WaitInterval(g_ceph_context, m_lock,
+	utime_t(g_ceph_context->_conf->rbd_mirror_image_state_check_interval, 0));
   }
 
   ImageIds empty_sources;
@@ -469,7 +468,7 @@ void Replayer::run()
     if (m_image_replayers.empty()) {
       break;
     }
-    m_cond.WaitInterval(m_lock, seconds(1));
+    m_cond.WaitInterval(g_ceph_context, m_lock, seconds(1));
   }
 }
 

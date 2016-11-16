@@ -86,8 +86,8 @@ void SafeTimer::timer_thread()
   lock.Lock();
   ldout(cct,10) << "timer_thread starting" << dendl;
   while (!stopping) {
-    utime_t now = ceph_clock_now();
-
+    utime_t now = ceph_clock_now(cct);
+    
     while (!schedule.empty()) {
       scheduled_map_t::iterator p = schedule.begin();
 
@@ -126,7 +126,7 @@ void SafeTimer::add_event_after(double seconds, Context *callback)
 {
   assert(lock.is_locked());
 
-  utime_t when = ceph_clock_now();
+  utime_t when = ceph_clock_now(cct);
   when += seconds;
   add_event_at(when, callback);
 }

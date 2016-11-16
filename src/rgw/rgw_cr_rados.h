@@ -565,7 +565,7 @@ class RGWAsyncWait : public RGWAsyncRadosRequest {
 protected:
   int _send_request() {
     Mutex::Locker l(*lock);
-    return cond->WaitInterval(*lock, interval);
+    return cond->WaitInterval(cct, *lock, interval);
   }
 public:
   RGWAsyncWait(RGWCoroutine *caller, RGWAioCompletionNotifier *cn, CephContext *_cct,
