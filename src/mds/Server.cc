@@ -3285,6 +3285,8 @@ void Server::handle_client_openc(MDRequestRef& mdr)
   }
 
   journal_and_reply(mdr, in, dn, le, fin);
+
+  mds->balancer->hit_dir(mdr->get_mds_stamp(), dir, META_POP_IWR);
 }
 
 
