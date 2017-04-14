@@ -1141,19 +1141,177 @@ namespace rgw {
     return rc;
   } /* RGWFileHandle::write_finish */
 
+  int RGWFileHandle::write_finish2(uint32_t flags)
+  {
+    unique_lock guard{mtx, std::defer_lock};
+    int rc = 0;
+
+    if (! (flags & FLAG_LOCKED)) {
+      guard.lock();
+    }
+
+    file* f = get<file>(&variant_type);
+    std::string object_name = relative_object_name();
+    if (f->extents.size() > 0) {
+      auto write_req = new RGWWriteRequest2(fs->get_context(), fs->get_user(),
+					    this, bucket_name(), object_name);
+      write_req->put_data(f->extents.begin()->second.bl);
+      write_req->set_part_num(f->part_num + 1);
+      write_req->set_upload_id(f->prepare_req->get_upload_id());
+      rc = rgwlib.get_fe()->execute_req(write_req);
+      if (rc < 0) {
+	lsubdout(fs->get_context(), rgw, 5)
+	  << __func__
+	  << this->object_name()
+	  << " write end failed "
+	  << " (" << rc << ")"
+	  << dendl;
+      } else {
+	f->pop_front_extent();
+      }
+    }
+
+    if (f->flags & RGWFileHandle::file::FLAG_PARTED) {
+      lsubdout(fs->get_context(), rgw, 10)
+	<< __func__
+	<< " finishing write trans on " << this->object_name()
+	<< dendl;
+      f->commit_req = new RGWCommitWriteRequest(fs->get_context(), fs->get_user(),
+						this, bucket_name(), object_name);
+      f->commit_req->set_upload_id(f->prepare_req->get_upload_id());
+      rc = rgwlib.get_fe()->execute_req(f->commit_req);
+      if (rc < 0) {
+	lsubdout(fs->get_context(), rgw, 5)
+	  << __func__
+	  << this->object_name()
+	  << " commit write failed "
+	  << " (" << rc << ")"
+	  << dendl;
+	return -EIO;
+      }
+    }
+
+    return rc;
+  } /* RGWFileHandle::write_finish */
+
+  int RGWFileHandle::write2(uint64_t off, size_t len, size_t *bytes_written,
+			    void *buffer)
+  {
+    using std::get;
+
+    lock_guard guard(mtx);
+
+    int rc = 0;
+
+    file* f = get<file>(&variant_type);
+    if (! f)
+      return -EISDIR;
+
+    if (deleted()) {
+      lsubdout(fs->get_context(), rgw, 5)
+	<< __func__
+	<< " write attempted on deleted object "
+	<< this->object_name()
+	<< dendl;
+      return -ESTALE;
+    }
+
+    std::string object_name = relative_object_name();
+
+    // init multipart
+    if (!(f->flags & RGWFileHandle::file::FLAG_PARTED)) {
+      f->prepare_req = new RGWPrepareWriteRequest(fs->get_context(), fs->get_user(),
+						  this, bucket_name(), object_name);
+      rc = rgwlib.get_fe()->execute_req(f->prepare_req);
+      if (rc < 0) {
+	lsubdout(fs->get_context(), rgw, 5)
+	  << __func__
+	  << this->object_name()
+	  << " prepare write failed " << off
+	  << " (" << rc << ")"
+	  << dendl;
+	return -EIO;
+      }
+      f->flags |= RGWFileHandle::file::FLAG_PARTED;
+    }
+
+    // record extent, if full_extent, multipart upload
+    bool full_extent = f->add_extent(off + len, len, buffer);
+    if (full_extent) {
+      auto write_req = new RGWWriteRequest2(fs->get_context(), fs->get_user(),
+					    this, bucket_name(), object_name);
+      write_req->put_data(f->extents.begin()->second.bl);
+      write_req->set_part_num(f->part_num);
+      write_req->set_upload_id(f->prepare_req->get_upload_id());
+      rc = rgwlib.get_fe()->execute_req(write_req);
+      if (rc < 0) {
+	lsubdout(fs->get_context(), rgw, 5)
+	  << __func__
+	  << this->object_name()
+	  << " write start failed " << off
+	  << " (" << rc << ")"
+	  << dendl;
+      } else {
+	f->pop_front_extent();
+      }
+    }
+
+    *bytes_written = (rc == 0) ? len : 0;
+    return 0;
+  }
+
   int RGWFileHandle::close()
   {
     lock_guard guard(mtx);
 
-    int rc = write_finish(FLAG_LOCKED);
+    int rc = write_finish2(FLAG_LOCKED);
 
     flags &= ~FLAG_OPEN;
     return rc;
   } /* RGWFileHandle::close */
 
+  bool RGWFileHandle::file::add_extent(uint64_t end, size_t len, void *buf)
+  {
+    bool full = false;
+    uint64_t prev_key = end - len;
+    auto new_extent = new extent(end, len, buf);
+    uint64_t min_part_size = rgwlib.get_store()->ctx()->_conf->rgw_multipart_min_part_size;
+
+    // fine prev and next, then merge
+    auto prev = extents.find(prev_key);
+    auto next = extents.upper_bound(end);
+    if (prev != extents.end()) {
+      new_extent->bl.claim_prepend(prev->second.bl);
+      extents.erase(prev);
+    }
+    if (next != extents.end()) {
+      new_extent->end = next->first;
+      new_extent->bl.claim_append(next->second.bl);
+      extents.erase(next);
+    }
+    extents.insert(std::pair<uint64_t, extent>(new_extent->end, *new_extent));
+
+    // at head for now
+    auto head = extents.begin();
+    if (head->second.bl.length() >= min_part_size) {
+      full = true;
+      part_num++;
+    }
+
+    return full;
+  }
+
+  void RGWFileHandle::file::pop_front_extent()
+  {
+    extents.erase(extents.begin());
+  }
+
   RGWFileHandle::file::~file()
   {
     delete write_req;
+    delete prepare_req;
+    delete commit_req;
+    clear_extents();
   }
 
   void RGWFileHandle::clear_state()
@@ -1207,6 +1365,17 @@ namespace rgw {
   done:
     return op_ret;
   } /* exec_start */
+
+  static int get_obj_attrs(RGWRados *store, struct req_state *s, rgw_obj& obj, map<string, bufferlist>& attrs)
+  {
+    RGWRados::Object op_target(store, s->bucket_info, *static_cast<RGWObjectCtx *>(s->obj_ctx), obj);
+    RGWRados::Object::Read read_op(&op_target);
+
+    read_op.params.attrs = &attrs;
+    read_op.params.perr = &s->err;
+
+    return read_op.prepare();
+  }
 
   int RGWWriteRequest::exec_continue()
   {
@@ -1350,6 +1519,329 @@ namespace rgw {
     return op_ret;
   } /* exec_finish */
 
+  void RGWWriteRequest2::execute() {
+    struct req_state* s = get_state();
+    buffer::list bl, aclbl, ux_key, ux_attrs;
+    map<string, string>::iterator iter;
+    char calc_md5[CEPH_CRYPTO_MD5_DIGESTSIZE * 2 + 1];
+    unsigned char m[CEPH_CRYPTO_MD5_DIGESTSIZE];
+    bool need_to_wait = true;
+    bufferlist orig_data;
+    size_t len;
+
+    /* not obviously supportable */
+    assert(! dlo_manifest);
+    assert(! slo_info);
+
+    perfcounter->inc(l_rgw_put);
+    op_ret = -EINVAL;
+
+    if (s->object.empty()) {
+      ldout(s->cct, 0) << __func__ << " called on empty object" << dendl;
+      goto done;
+    }
+
+    op_ret = get_params();
+    if (op_ret < 0) {
+      goto done;
+    }
+
+    op_ret = get_system_versioning_params(s, &olh_epoch, &version_id);
+    if (op_ret < 0) {
+      goto done;
+    }
+
+    /* user-supplied MD5 check skipped (not supplied) */
+    /* early quota check skipped--we don't have size yet */
+    /* skipping user-supplied etag--we might have one in future, but
+     * like data it and other attrs would arrive after open */
+    processor = select_processor(*static_cast<RGWObjectCtx *>(s->obj_ctx),
+				 &multipart);
+    op_ret = processor->prepare(rgwlib.get_store(), NULL);
+
+    len = data.length();
+    if (! len) {
+      return;
+    }
+
+    if (need_to_wait) {
+      orig_data = data;
+    }
+    hash.Update((const byte *)data.c_str(), data.length());
+    op_ret = put_data_and_throttle(processor, data, ofs,
+				   need_to_wait);
+    if (op_ret < 0) {
+      if (!need_to_wait || op_ret != -EEXIST) {
+	ldout(s->cct, 20) << "processor->thottle_data() returned ret="
+			  << op_ret << dendl;
+	goto done;
+      }
+
+      ldout(s->cct, 5) << "NOTICE: processor->throttle_data() returned -EEXIST, need to restart write" << dendl;
+
+      /* restore original data */
+      data.swap(orig_data);
+
+      /* restart processing with different oid suffix */
+      dispose_processor(processor);
+      processor = select_processor(*static_cast<RGWObjectCtx *>(s->obj_ctx),
+				   &multipart);
+
+      string oid_rand;
+      char buf[33];
+      gen_rand_alphanumeric(rgwlib.get_store()->ctx(), buf, sizeof(buf) - 1);
+      oid_rand.append(buf);
+
+      op_ret = processor->prepare(rgwlib.get_store(), &oid_rand);
+      if (op_ret < 0) {
+	ldout(s->cct, 0) << "ERROR: processor->prepare() returned "
+			 << op_ret << dendl;
+	goto done;
+      }
+
+      op_ret = put_data_and_throttle(processor, data, ofs, false);
+      if (op_ret < 0) {
+	goto done;
+      }
+    }
+    bytes_written += len;
+
+    s->obj_size = ofs; // XXX check ofs
+    perfcounter->inc(l_rgw_put_b, s->obj_size);
+
+    op_ret = rgwlib.get_store()->check_quota(s->bucket_owner.get_id(), s->bucket,
+					     user_quota, bucket_quota, s->obj_size);
+    if (op_ret < 0) {
+      goto done;
+    }
+
+    hash.Final(m);
+
+    buf_to_hex(m, CEPH_CRYPTO_MD5_DIGESTSIZE, calc_md5);
+    etag = calc_md5;
+
+    bl.append(etag.c_str(), etag.size() + 1);
+    emplace_attr(RGW_ATTR_ETAG, std::move(bl));
+
+    policy.encode(aclbl);
+    emplace_attr(RGW_ATTR_ACL, std::move(aclbl));
+
+    rgw_fh->encode_attrs(ux_key, ux_attrs);
+    emplace_attr(RGW_ATTR_UNIX_KEY1, std::move(ux_key));
+    emplace_attr(RGW_ATTR_UNIX1, std::move(ux_attrs));
+
+    for (iter = s->generic_attrs.begin(); iter != s->generic_attrs.end();
+	 ++iter) {
+      buffer::list& attrbl = attrs[iter->first];
+      const string& val = iter->second;
+      attrbl.append(val.c_str(), val.size() + 1);
+    }
+
+    rgw_get_request_metadata(s->cct, s->info, attrs);
+    encode_delete_at_attr(delete_at, attrs);
+
+    /* Add a custom metadata to expose the information whether an object
+     * is an SLO or not. Appending the attribute must be performed AFTER
+     * processing any input from user in order to prohibit overwriting. */
+    if (unlikely(!! slo_info)) {
+      buffer::list slo_userindicator_bl;
+      ::encode("True", slo_userindicator_bl);
+      emplace_attr(RGW_ATTR_SLO_UINDICATOR, std::move(slo_userindicator_bl));
+    }
+
+    op_ret = processor->complete(s->obj_size, etag, &mtime, real_time(), attrs,
+                                (delete_at ? *delete_at : real_time()), if_match, if_nomatch);
+    if (! op_ret) {
+      /* update stats */
+      rgw_fh->set_mtime(real_clock::to_timespec(mtime));
+      rgw_fh->set_ctime(real_clock::to_timespec(mtime));
+      rgw_fh->grow_size(bytes_written);
+    }
+
+  done:
+    dispose_processor(processor);
+    perfcounter->tinc(l_rgw_put_lat,
+		     (ceph_clock_now() - s->time));
+  } /* execute */
+
+  void RGWCommitWriteRequest::execute()
+  {
+    struct req_state* s = get_state();
+    string meta_oid;
+    map<uint32_t, RGWUploadPartInfo> obj_parts;
+    map<uint32_t, RGWUploadPartInfo>::iterator obj_iter;
+    map<string, bufferlist> attrs;
+    off_t ofs = 0;
+    MD5 hash;
+    char final_etag[CEPH_CRYPTO_MD5_DIGESTSIZE];
+    char final_etag_str[CEPH_CRYPTO_MD5_DIGESTSIZE * 2 + 16];
+    bufferlist etag_bl;
+    rgw_obj meta_obj;
+    rgw_obj target_obj;
+    RGWMPObj mp;
+    RGWObjManifest manifest;
+    uint64_t olh_epoch = 0;
+    string version_id;
+
+    op_ret = get_params();
+    if (op_ret < 0)
+      return;
+
+    op_ret = get_system_versioning_params(s, &olh_epoch, &version_id);
+    if (op_ret < 0) {
+      return;
+    }
+
+    mp.init(s->object.name, upload_id);
+    meta_oid = mp.get_meta();
+
+    int handled_parts = 0;
+    int max_parts = 1000;
+    int marker = 0;
+    bool truncated;
+    RGWCompressionInfo cs_info;
+    bool compressed = false;
+    uint64_t accounted_size = 0;
+
+    uint64_t min_part_size = s->cct->_conf->rgw_multipart_min_part_size;
+
+    list<rgw_obj_index_key> remove_objs; /* objects to be removed from index listing */
+
+    bool versioned_object = s->bucket_info.versioning_enabled();
+
+    meta_obj.init_ns(s->bucket, meta_oid, RGW_OBJ_NS_MULTIPART);
+    meta_obj.set_in_extra_data(true);
+    meta_obj.index_hash_source = s->object.name;
+
+    op_ret = get_obj_attrs(rgwlib.get_store(), s, meta_obj, attrs);
+    if (op_ret < 0) {
+      ldout(s->cct, 0) << "ERROR: failed to get obj attrs, obj=" << meta_obj
+  		     << " ret=" << op_ret << dendl;
+      return;
+    }
+
+    do {
+      op_ret = list_multipart_parts(rgwlib.get_store(), s, upload_id, meta_oid, max_parts,
+				    marker, obj_parts, &marker, &truncated);
+      if (op_ret == -ENOENT) {
+        op_ret = -ERR_NO_SUCH_UPLOAD;
+      }
+      if (op_ret < 0)
+        return;
+
+      for (obj_iter = obj_parts.begin(); obj_iter != obj_parts.end(); ++obj_iter, ++handled_parts) {
+        uint64_t part_size = obj_iter->second.accounted_size;
+      if (handled_parts < (int)obj_parts.size() - 1 &&
+          part_size < min_part_size) {
+        op_ret = -ERR_TOO_SMALL;
+        return;
+      }
+  
+        char petag[CEPH_CRYPTO_MD5_DIGESTSIZE];
+  
+        hex_to_buf(obj_iter->second.etag.c_str(), petag,
+  		CEPH_CRYPTO_MD5_DIGESTSIZE);
+        hash.Update((const byte *)petag, sizeof(petag));
+  
+        RGWUploadPartInfo& obj_part = obj_iter->second;
+  
+        /* update manifest for part */
+        string oid = mp.get_part(obj_iter->second.num);
+        rgw_obj src_obj;
+        src_obj.init_ns(s->bucket, oid, RGW_OBJ_NS_MULTIPART);
+  
+        if (obj_part.manifest.empty()) {
+          ldout(s->cct, 0) << "ERROR: empty manifest for object part: obj="
+  			 << src_obj << dendl;
+          op_ret = -ERR_INVALID_PART;
+          return;
+        } else {
+          manifest.append(obj_part.manifest, rgwlib.get_store());
+        }
+  
+        if (obj_part.cs_info.compression_type != "none") {
+          if (compressed && cs_info.compression_type != obj_part.cs_info.compression_type) {
+            ldout(s->cct, 0) << "ERROR: compression type was changed during multipart upload ("
+                             << cs_info.compression_type << ">>" << obj_part.cs_info.compression_type << ")" << dendl;
+            op_ret = -ERR_INVALID_PART;
+            return;
+          }
+          int new_ofs; // offset in compression data for new part
+          if (cs_info.blocks.size() > 0)
+            new_ofs = cs_info.blocks.back().new_ofs + cs_info.blocks.back().len;
+          else
+            new_ofs = 0;
+          for (const auto& block : obj_part.cs_info.blocks) {
+            compression_block cb;
+            cb.old_ofs = block.old_ofs + cs_info.orig_size;
+            cb.new_ofs = new_ofs;
+            cb.len = block.len;
+            cs_info.blocks.push_back(cb);
+            new_ofs = cb.new_ofs + cb.len;
+          } 
+          if (!compressed)
+            cs_info.compression_type = obj_part.cs_info.compression_type;
+          cs_info.orig_size += obj_part.cs_info.orig_size;
+          compressed = true;
+        }
+  
+        rgw_obj_index_key remove_key;
+        src_obj.key.get_index_key(&remove_key);
+  
+        remove_objs.push_back(remove_key);
+  
+        ofs += obj_part.size;
+        accounted_size += obj_part.accounted_size;
+      }
+    } while (truncated);
+    hash.Final((byte *)final_etag);
+  
+    buf_to_hex((unsigned char *)final_etag, sizeof(final_etag), final_etag_str);
+    snprintf(&final_etag_str[CEPH_CRYPTO_MD5_DIGESTSIZE * 2],  sizeof(final_etag_str) - CEPH_CRYPTO_MD5_DIGESTSIZE * 2,
+             "-%lld", (long long)obj_parts.size());
+    etag = final_etag_str;
+    ldout(s->cct, 10) << "calculated etag: " << final_etag_str << dendl;
+  
+    etag_bl.append(final_etag_str, strlen(final_etag_str) + 1);
+  
+    attrs[RGW_ATTR_ETAG] = etag_bl;
+  
+    if (compressed) {
+      // write compression attribute to full object
+      bufferlist tmp;
+      ::encode(cs_info, tmp);
+      attrs[RGW_ATTR_COMPRESSION] = tmp;
+    }
+  
+    target_obj.init(s->bucket, s->object.name);
+    if (versioned_object) {
+      rgwlib.get_store()->gen_rand_obj_instance_name(&target_obj);
+    }
+  
+    RGWObjectCtx& obj_ctx = *static_cast<RGWObjectCtx *>(s->obj_ctx);
+  
+    obj_ctx.obj.set_atomic(target_obj);
+  
+    RGWRados::Object op_target(rgwlib.get_store(), s->bucket_info, *static_cast<RGWObjectCtx *>(s->obj_ctx), target_obj);
+    RGWRados::Object::Write obj_op(&op_target);
+  
+    obj_op.meta.manifest = &manifest;
+    obj_op.meta.remove_objs = &remove_objs;
+  
+    obj_op.meta.ptag = &s->req_id; /* use req_id as operation tag */
+    obj_op.meta.owner = s->owner.get_id();
+    obj_op.meta.flags = PUT_OBJ_CREATE;
+    op_ret = obj_op.write_meta(ofs, accounted_size, attrs);
+    if (op_ret < 0)
+      return;
+  
+    // remove the upload obj
+    int r = rgwlib.get_store()->delete_obj(*static_cast<RGWObjectCtx *>(s->obj_ctx),
+  			    s->bucket_info, meta_obj, 0);
+    if (r < 0) {
+      ldout(rgwlib.get_store()->ctx(), 0) << "WARNING: failed to remove object " << meta_obj << dendl;
+    }
+  }
 } /* namespace rgw */
 
 /* librgw */
@@ -1741,7 +2233,7 @@ int rgw_write(struct rgw_fs *rgw_fs,
   if (! rgw_fh->is_open())
     return -EPERM;
 
-  rc = rgw_fh->write(offset, length, bytes_written, buffer);
+  rc = rgw_fh->write2(offset, length, bytes_written, buffer);
 
   return rc;
 }

@@ -48,7 +48,6 @@
 #define RGW_RWMODE (RGW_RWXMODE &			\
 		      ~(S_IXUSR | S_IXGRP | S_IXOTH))
 
-
 namespace rgw {
 
   template <typename T>
@@ -60,6 +59,9 @@ namespace rgw {
   class RGWLibFS;
   class RGWFileHandle;
   class RGWWriteRequest;
+  class RGWWriteRequest2;
+  class RGWPrepareWriteRequest;
+  class RGWCommitWriteRequest;
 
   static inline bool operator <(const struct timespec& lhs,
 				const struct timespec& rhs) {
@@ -199,10 +201,36 @@ namespace rgw {
 		ctime{0,0}, mtime{0,0}, atime{0,0} {}
     } state;
 
+    struct extent {
+      uint64_t end;	// use end, not off, so find_nearest is easy
+      bufferlist bl;
+
+      extent(uint64_t _end, size_t _len, void *buf)
+	: end(_end) {
+	bl.append((const char *)buf, _len);
+      }
+      ~extent() {};
+    };
+
     struct file {
-      RGWWriteRequest* write_req;
-      file() : write_req(nullptr) {}
+
+      static constexpr uint32_t FLAG_PARTED = 0x0001;
+
+      std::map<uint64_t, extent> extents;
+      RGWWriteRequest *write_req;
+      RGWPrepareWriteRequest *prepare_req;
+      RGWCommitWriteRequest *commit_req;
+      int part_num;
+      uint32_t flags;
+
+      file() : write_req(nullptr), prepare_req(nullptr), commit_req(nullptr),
+	       part_num(-1), flags(0) {}
       ~file();
+
+      bool add_extent(uint64_t end, size_t len, void *buf);
+      void pop_front_extent();
+      void clear_extents() { extents.clear(); }
+
     };
 
     struct directory {
@@ -519,6 +547,7 @@ namespace rgw {
     int readdir(rgw_readdir_cb rcb, void *cb_arg, uint64_t *offset, bool *eof,
 		uint32_t flags);
     int write(uint64_t off, size_t len, size_t *nbytes, void *buffer);
+    int write2(uint64_t off, size_t len, size_t *nbytes, void *buffer);
 
     int commit(uint64_t offset, uint64_t length, uint32_t flags) {
       /* NFS3 and NFSv4 COMMIT implementation
@@ -531,6 +560,7 @@ namespace rgw {
     }
 
     int write_finish(uint32_t flags = FLAG_NONE);
+    int write_finish2(uint32_t flags = FLAG_NONE);
     int close();
 
     void open_for_create() {
@@ -553,6 +583,10 @@ namespace rgw {
 
     void set_size(const size_t size) {
       state.size = size;
+    }
+
+    void grow_size(const size_t size) {
+      state.size += size;
     }
 
     void set_times(real_time t) {
@@ -778,7 +812,7 @@ namespace rgw {
       }
 
       void operator()() {
-	rgw_fh.write_finish();
+	rgw_fh.write_finish2();
 	rgw_fh.get_fs()->unref(&rgw_fh);
       }
     };
@@ -2403,6 +2437,224 @@ public:
   void send_response() override {}
 
 }; /* RGWSetAttrsRequest */
+
+class RGWPrepareWriteRequest : public RGWLibRequest,
+			       public RGWInitMultipart
+{
+public:
+  const std::string& bucket_name;
+  const std::string& obj_name;
+  RGWFileHandle* rgw_fh;
+
+  RGWPrepareWriteRequest(CephContext* _cct, RGWUserInfo* _user, RGWFileHandle* _fh,
+			 const std::string& _bname, const std::string& _oname)
+    : RGWLibRequest(_cct, _user), bucket_name(_bname), obj_name(_oname), rgw_fh(_fh) {}
+  ~RGWPrepareWriteRequest() override {}
+
+  bool only_bucket() override { return true; }
+
+  int op_init() override {
+    // assign store, s, and dialect_handler
+    RGWObjectCtx* rados_ctx
+      = static_cast<RGWObjectCtx*>(get_state()->obj_ctx);
+    // framework promises to call op_init after parent init
+    assert(rados_ctx);
+    RGWOp::init(rados_ctx->store, get_state(), this);
+    op = this; // assign self as op: REQUIRED
+    return 0;
+  }
+
+  int header_init() override {
+
+    struct req_state* s = get_state();
+    s->info.method = "PUT";
+    s->op = OP_PUT;
+
+    /* XXX derp derp derp */
+    std::string uri = make_uri(bucket_name, obj_name);
+    s->relative_uri = uri;
+    s->info.request_uri = uri; // XXX
+    s->info.effective_uri = uri;
+    s->info.request_params = "";
+    s->info.domain = ""; /* XXX ? */
+
+    // woo
+    s->user = user;
+
+    return 0;
+  }
+
+  int get_params() override {
+    struct req_state* s = get_state();
+    RGWAccessControlPolicy_S3 s3policy(s->cct);
+    /* we don't have (any) headers, so just create canned ACLs */
+    int ret = s3policy.create_canned(s->owner, s->bucket_owner, s->canned_acl);
+    policy = s3policy;
+    return ret;
+  }
+  void send_response() override {}
+
+  std::string& get_upload_id() {
+    return upload_id;
+  }
+};
+
+class RGWCommitWriteRequest : public RGWLibRequest,
+			      public RGWCompleteMultipart
+{
+public:
+  const std::string& bucket_name;
+  const std::string& obj_name;
+  RGWFileHandle* rgw_fh;
+
+  RGWCommitWriteRequest(CephContext* _cct, RGWUserInfo* _user, RGWFileHandle* _fh,
+    const std::string& _bname, const std::string& _oname)
+    : RGWLibRequest(_cct, _user), bucket_name(_bname), obj_name(_oname), rgw_fh(_fh) {}
+  ~RGWCommitWriteRequest() override {}
+
+  bool only_bucket() override { return true; }
+
+  int op_init() override {
+    // assign store, s, and dialect_handler
+    RGWObjectCtx* rados_ctx
+      = static_cast<RGWObjectCtx*>(get_state()->obj_ctx);
+    // framework promises to call op_init after parent init
+    assert(rados_ctx);
+    RGWOp::init(rados_ctx->store, get_state(), this);
+    op = this; // assign self as op: REQUIRED
+    return 0;
+  }
+
+  int header_init() override {
+
+    struct req_state* s = get_state();
+    s->info.method = "PUT";
+    s->op = OP_PUT;
+
+    /* XXX derp derp derp */
+    std::string uri = make_uri(bucket_name, obj_name);
+    s->relative_uri = uri;
+    s->info.request_uri = uri; // XXX
+    s->info.effective_uri = uri;
+    s->info.request_params = "";
+    s->info.domain = ""; /* XXX ? */
+
+    // woo
+    s->user = user;
+
+    return 0;
+  }
+
+  int get_params() override {
+    return 0;
+  }
+  void send_response() override {}
+
+  void set_upload_id(const string &id) {
+    upload_id = id;
+  }
+
+  void execute() override;
+};
+
+class RGWWriteRequest2 : public RGWLibRequest,
+			 public RGWPutObj /* RGWOp */
+{
+public:
+  const std::string& bucket_name;
+  const std::string& obj_name;
+  RGWFileHandle* rgw_fh;
+  RGWPutObjProcessor *processor;
+  buffer::list data;
+  uint64_t timer_id;
+  MD5 hash;
+  size_t bytes_written;
+  bool multipart;
+  int part_num;
+  std::string upload_id;
+
+  RGWWriteRequest2(CephContext* _cct, RGWUserInfo *_user, RGWFileHandle* _fh,
+		   const std::string& _bname, const std::string& _oname)
+    : RGWLibRequest(_cct, _user), bucket_name(_bname), obj_name(_oname),
+      rgw_fh(_fh), processor(nullptr), bytes_written(0),
+      multipart(false), part_num(0), upload_id("") {
+    op = this;
+  }
+
+  bool only_bucket() override { return true; }
+
+  int op_init() override {
+    // assign store, s, and dialect_handler
+    RGWObjectCtx* rados_ctx
+      = static_cast<RGWObjectCtx*>(get_state()->obj_ctx);
+    // framework promises to call op_init after parent init
+    assert(rados_ctx);
+    RGWOp::init(rados_ctx->store, get_state(), this);
+    op = this; // assign self as op: REQUIRED
+    return 0;
+  }
+
+  int header_init() override {
+
+    struct req_state* s = get_state();
+    s->info.method = "PUT";
+    s->op = OP_PUT;
+
+    /* XXX derp derp derp */
+    std::string uri = make_uri(bucket_name, obj_name);
+    s->relative_uri = uri;
+    s->info.request_uri = uri; // XXX
+    s->info.effective_uri = uri;
+    s->info.request_params = "";
+    s->info.domain = ""; /* XXX ? */
+
+    // woo
+    s->user = user;
+
+    return 0;
+  }
+
+  int get_params() override {
+    struct req_state* s = get_state();
+    RGWAccessControlPolicy_S3 s3policy(s->cct);
+    /* we don't have (any) headers, so just create canned ACLs */
+    int ret = s3policy.create_canned(s->owner, s->bucket_owner, s->canned_acl);
+    policy = s3policy;
+
+    s->info.args.append("partNumber", std::to_string(part_num));
+    s->info.args.append("uploadId", upload_id);
+
+    return ret;
+  }
+
+  int get_data(buffer::list& _bl) override {
+    /* XXX for now, use sharing semantics */
+    uint32_t len = data.length();
+    _bl.claim(data);
+    bytes_written += len;
+    return len;
+  }
+
+  void put_data(buffer::list& _bl) {
+    data.claim(_bl);
+  }
+
+  void set_part_num(int num) {
+    part_num = num;
+  }
+
+  void set_upload_id(const string &id) {
+    upload_id = id;
+  }
+
+  void execute() override;
+
+  void send_response() override {}
+
+  int verify_params() override {
+    return 0;
+  }
+}; /* RGWWriteRequest */
 
 } /* namespace rgw */
 
