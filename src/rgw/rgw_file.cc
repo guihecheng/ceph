@@ -1155,6 +1155,11 @@ namespace rgw {
     if (f->extents.size() > 0) {
       auto write_req = new RGWWriteRequest2(fs->get_context(), fs->get_user(),
 					    this, bucket_name(), object_name);
+      lsubdout(fs->get_context(), rgw, 19)
+        << __func__
+        << " Tail  RGWWriteRequest2"
+        << " part_num = " << f->part_num + 1
+        << dendl;
       write_req->put_data(f->extents.begin()->second.bl);
       write_req->set_part_num(f->part_num + 1);
       write_req->set_upload_id(f->prepare_req->get_upload_id());
@@ -1174,6 +1179,12 @@ namespace rgw {
     if (f->flags & RGWFileHandle::file::FLAG_PARTED) {
       lsubdout(fs->get_context(), rgw, 10)
 	<< __func__
+	<< " RGWCommitWriteRequest "
+	<< this->object_name()
+	<< " upload_id = " << f->prepare_req->get_upload_id()
+	<< dendl;
+      lsubdout(fs->get_context(), rgw, 10)
+	<< __func__
 	<< " finishing write trans on " << this->object_name()
 	<< dendl;
       f->commit_req = new RGWCommitWriteRequest(fs->get_context(), fs->get_user(),
@@ -1187,9 +1198,16 @@ namespace rgw {
 	  << " commit write failed "
 	  << " (" << rc << ")"
 	  << dendl;
-	return -EIO;
       }
     }
+
+    delete f->prepare_req;
+    delete f->commit_req;
+    f->prepare_req = nullptr;
+    f->commit_req = nullptr;
+    f->part_num = 0;
+    f->flags = 0;
+    f->clear_extents();
 
     return rc;
   } /* RGWFileHandle::write_finish */
@@ -1202,6 +1220,11 @@ namespace rgw {
     lock_guard guard(mtx);
 
     int rc = 0;
+
+    lsubdout(fs->get_context(), rgw, 19) << __func__
+					 << " off = " << off
+					 << " len = " << len
+					 << dendl;
 
     file* f = get<file>(&variant_type);
     if (! f)
@@ -1232,6 +1255,10 @@ namespace rgw {
 	  << dendl;
 	return -EIO;
       }
+      lsubdout(fs->get_context(), rgw, 19) << __func__
+					   << " RGWPrepareWriteRequest"
+					   << " upload_id = " << f->prepare_req->get_upload_id()
+					   << dendl;
       f->flags |= RGWFileHandle::file::FLAG_PARTED;
     }
 
@@ -1243,6 +1270,10 @@ namespace rgw {
       write_req->put_data(f->extents.begin()->second.bl);
       write_req->set_part_num(f->part_num);
       write_req->set_upload_id(f->prepare_req->get_upload_id());
+      lsubdout(fs->get_context(), rgw, 19) << __func__
+					   << " RGWWriteRequest2"
+					   << " part_num = " << f->part_num
+					   << dendl;
       rc = rgwlib.get_fe()->execute_req(write_req);
       if (rc < 0) {
 	lsubdout(fs->get_context(), rgw, 5)
@@ -1293,6 +1324,10 @@ namespace rgw {
 
     // at head for now
     auto head = extents.begin();
+    if (head->first - head->second.bl.length() != 0 && part_num < 0) {
+      return false;
+    }
+
     if (head->second.bl.length() >= min_part_size) {
       full = true;
       part_num++;
